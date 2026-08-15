@@ -11,6 +11,10 @@ namespace Proxify.Common;
 ///   [1 байт ]  тип кадра
 ///                0x01 = данные без шифрования  -> далее внутренний кадр данных
 ///                0x02 = данные с шифрованием   -> далее [12]nonce [16]tag [N]ciphertext
+///                0x03 = PING (диагностика связи при запуске прокси-клиента)
+///                0x04 = PONG (ответ прокси-сервера на PING)
+///                 для 0x03/0x04 тело = маркер (например, случайные байты);
+///                 при заданном cipher тело шифруется как [12]nonce [16]tag [M]ciphertext
 ///
 /// Внутренний кадр данных (расшифрованный текст для типа 0x02):
 ///
@@ -26,6 +30,8 @@ public static class Frame
     public const ushort Magic = 0xC0DE;
     public const byte TypeData = 0x01;
     public const byte TypeDataEncrypted = 0x02;
+    public const byte TypePing = 0x03;
+    public const byte TypePong = 0x04;
 
     public const int HeaderLength = 3;
     public const int InnerHeaderLength = 11;
@@ -106,6 +112,50 @@ public static class Frame
             return null;
 
         return buffer[o];
+    }
+
+    /// <summary>
+    /// Собирает служебный кадр (PING/PONG). Тело кадра при заданном cipher шифруется.
+    /// </summary>
+    public static byte[] EncodeControl(byte type, byte[] payload, TunnelCipher? cipher)
+    {
+        var body = cipher != null ? cipher.Wrap(payload) : payload;
+        var frame = new byte[HeaderLength + body.Length];
+        int o = 0;
+        WriteU16(frame, ref o, Magic);
+        frame[o++] = type;
+        body.CopyTo(frame.AsSpan(o));
+        return frame;
+    }
+
+    /// <summary>
+    /// Разбирает служебный кадр (PING/PONG) и возвращает его тело (маркер).
+    /// Возвращает false, если кадр не того типа, имеет неверный magic или
+    /// не прошёл расшифровку (например, несовпадение ключа).
+    /// </summary>
+    public static bool TryDecodeControl(byte[] buffer, int length, byte expectedType, TunnelCipher? cipher, out byte[] payload)
+    {
+        payload = Array.Empty<byte>();
+
+        if (buffer == null || length < HeaderLength)
+            return false;
+
+        int o = 0;
+        if (ReadU16(buffer, ref o) != Magic)
+            return false;
+
+        if (buffer[o++] != expectedType)
+            return false;
+
+        var body = buffer.AsSpan(o, length - o);
+
+        if (cipher == null)
+        {
+            payload = body.ToArray();
+            return true;
+        }
+
+        return cipher.TryUnwrap(body, out payload);
     }
 
     private static byte[] BuildDataFrame(IPAddress clientIp, ushort clientPort, ReadOnlySpan<byte> payload)

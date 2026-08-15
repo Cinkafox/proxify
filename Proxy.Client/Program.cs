@@ -1,7 +1,9 @@
 ﻿using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Threading;
 using Proxify.Client;
 using Proxify.Common;
 
@@ -9,24 +11,60 @@ Console.OutputEncoding = Encoding.UTF8;
 
 PrintUsage();
 
-IPEndPoint proxyServer = NetUtils.TryParseEndpoint(args.Length > 0 ? args[0] : null, out var ps)
-    ? ps
-    : new IPEndPoint(IPAddress.Loopback, 27015);
+IPEndPoint proxyServer = new IPEndPoint(IPAddress.Loopback, 27015);
+if (args.Length > 0)
+{
+    if (!NetUtils.TryParseEndpoint(args[0], out var ps))
+    {
+        Console.WriteLine($"[ошибка конфигурации] Адрес прокси-сервера '{args[0]}' не распознан (ожидается 'ip:port').");
+        return 1;
+    }
+    proxyServer = ps;
+}
 
-IPAddress gameIp = args.Length > 1 && IPAddress.TryParse(args[1], out var gi)
-    ? gi
-    : IPAddress.Loopback;
+IPAddress gameIp = IPAddress.Loopback;
+if (args.Length > 1)
+{
+    if (!IPAddress.TryParse(args[1], out var gi))
+    {
+        Console.WriteLine($"[ошибка конфигурации] gameIp '{args[1]}' не является IP-адресом.");
+        return 1;
+    }
+    gameIp = gi;
+}
+if (gameIp.AddressFamily != AddressFamily.InterNetwork)
+{
+    Console.WriteLine("[ошибка конфигурации] gameIp должен быть IPv4-адресом.");
+    return 1;
+}
 
-int gamePort = args.Length > 2 && int.TryParse(args[2], out int gp) && gp is >= 1 and <= 65535
-    ? gp
-    : 7777;
+int gamePort = 7777;
+if (args.Length > 2 && !NetUtils.TryParsePort(args[2], out gamePort))
+{
+    Console.WriteLine($"[ошибка конфигурации] gamePort '{args[2]}' не является допустимым (ожидается число от 1 до 65535).");
+    return 1;
+}
 
-int tunnelBindPort = args.Length > 3 && int.TryParse(args[3], out int tp) && tp is >= 1 and <= 65535
-    ? tp
-    : 5600;
+int tunnelBindPort = 5600;
+if (args.Length > 3 && !NetUtils.TryParsePort(args[3], out tunnelBindPort))
+{
+    Console.WriteLine($"[ошибка конфигурации] Порт туннеля '{args[3]}' не является допустимым (ожидается число от 1 до 65535).");
+    return 1;
+}
 
-bool captureReplies = NetUtils.TryParseBool(args.Length > 4 ? args[4] : null, true);
-bool loopbackAliases = NetUtils.TryParseBool(args.Length > 5 ? args[5] : null, true);
+bool captureReplies = true;
+if (args.Length > 4 && !bool.TryParse(args[4], out captureReplies))
+{
+    Console.WriteLine($"[ошибка конфигурации] captureReplies '{args[4]}' должен быть true или false.");
+    return 1;
+}
+
+bool loopbackAliases = true;
+if (args.Length > 5 && !bool.TryParse(args[5], out loopbackAliases))
+{
+    Console.WriteLine($"[ошибка конфигурации] loopbackAliases '{args[5]}' должен быть true или false.");
+    return 1;
+}
 
 string? key = args.Length > 6 ? args[6] : null;
 TunnelCipher? cipher = string.IsNullOrEmpty(key) ? null : TunnelCipher.FromPassphrase(key);
@@ -42,6 +80,7 @@ Console.WriteLine();
 
 try
 {
+    await HandshakeAsync(proxyServer, cipher);
     await RunAsync(proxyServer, gameIp, (ushort)gamePort, tunnelBindPort, captureReplies, loopbackAliases, cipher);
 }
 catch (SocketException ex) when (ex.SocketErrorCode == SocketError.AccessDenied)
@@ -63,6 +102,8 @@ catch (Exception ex)
     Console.WriteLine($"[!] Необработанная ошибка: {ex.Message}");
     Console.WriteLine(ex);
 }
+
+return 0;
 
 static void PrintUsage()
 {
@@ -87,6 +128,80 @@ static void PrintUsage()
     Console.WriteLine("привязан к 0.0.0.0:{gamePort} (или 127.0.0.1:{gamePort}), чтобы видеть");
     Console.WriteLine("подменённые пакеты с настоящими IP клиентов.");
     Console.WriteLine();
+    Console.WriteLine("При запуске выполняется PING/PONG к прокси-серверу — результат связи");
+    Console.WriteLine("печатается как [диагностика]. Раз в минуту печатается статистика [stats].");
+    Console.WriteLine();
+}
+
+/// Проверка связи с прокси-сервером: отправляет PING (3 попытки по 2 с) и ждёт PONG.
+/// Работает даже при несовпадении ключа — сервер ответит «не разобранным» PING,
+/// и клиент это увидит в логе сервера. При неудаче клиент всё равно продолжает работу.
+static async Task<bool> HandshakeAsync(IPEndPoint proxyServer, TunnelCipher? cipher)
+{
+    Console.WriteLine("[диагностика] Проверка связи с прокси-сервером (PING/PONG)...");
+
+    var token = Guid.NewGuid().ToByteArray();
+    var ping = Frame.EncodeControl(Frame.TypePing, token, cipher);
+
+    using var socket = new UdpClient();
+    socket.Client.ReceiveTimeout = 2000;
+
+    for (int attempt = 1; attempt <= 3; attempt++)
+    {
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            await socket.SendAsync(ping, ping.Length, proxyServer);
+        }
+        catch (SocketException ex)
+        {
+            Console.WriteLine($"[диагностика] Попытка {attempt}/3: ошибка отправки: {ex.Message}");
+            continue;
+        }
+
+        bool timeout = true;
+        var deadline = DateTime.UtcNow.AddSeconds(2);
+        while (DateTime.UtcNow < deadline)
+        {
+            EndPoint ep = new IPEndPoint(IPAddress.Any, 0);
+            byte[] resp;
+            try
+            {
+                IPEndPoint? remote = null;
+                resp = socket.Receive(ref remote);
+            }
+            catch (SocketException ex) when (ex.SocketErrorCode == SocketError.TimedOut)
+            {
+                break; // ждём до истечения таймаута, дальше — следующая попытка
+            }
+            catch (SocketException ex)
+            {
+                Console.WriteLine($"[диагностика] Попытка {attempt}/3: ошибка приёма: {ex.Message}");
+                timeout = false;
+                break;
+            }
+
+            if (Frame.TryDecodeControl(resp, resp.Length, Frame.TypePong, cipher, out var pongToken)
+                && pongToken.AsSpan().SequenceEqual(token))
+            {
+                sw.Stop();
+                Console.WriteLine($"[диагностика] OK: сервер {proxyServer} ответил на PING за {sw.ElapsedMilliseconds} мс.");
+                return true;
+            }
+
+            Console.WriteLine("[диагностика] Получен несоответствующий PONG — жду дальше.");
+        }
+
+        if (timeout)
+            Console.WriteLine($"[диагностика] Попытка {attempt}/3: сервер не ответил за 2 с.");
+    }
+
+    Console.WriteLine("[!] Связь с прокси-сервером не установлена. Проверьте:");
+    Console.WriteLine("[!]   1) прокси-сервер запущен и слушает UDP-порт (по умолчанию 27015);");
+    Console.WriteLine("[!]   2) файрвол машины A пропускает UDP-трафик на порт туннеля;");
+    Console.WriteLine("[!]   3) ключ шифрования совпадает у сервера и клиента (если используется).");
+    Console.WriteLine("[!] Прокси-клиент продолжит работу и выведет [диагностика], как только получит первый кадр.");
+    return false;
 }
 
 static async Task RunAsync(
@@ -107,20 +222,24 @@ static async Task RunAsync(
 
     var knownClients = new ConcurrentDictionary<IPEndPoint, DateTime>();
     var activeIps = new ConcurrentDictionary<IPAddress, DateTime>();
+    var stats = new TunnelStats();
+    int firstServerFrame = 0;
 
     var aliases = new LoopbackAliasManager(loopbackAliases);
     using var injector = new RawInjector(gameIp, gamePort);
     using var tunnel = new UdpClient(new IPEndPoint(IPAddress.Any, tunnelBindPort));
+    using var statsTimer = new Timer(_ => stats.Print("прокси-клиент"), null, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(1));
 
     ReplySniffer? sniffer = null;
     var tasks = new List<Task>
     {
-        Task.Run(() => ReceiveLoop(tunnel, aliases, injector, knownClients, activeIps, cipher, cts.Token))
+        Task.Run(() => ReceiveLoop(tunnel, aliases, injector, knownClients, activeIps, cipher, stats,
+            () => Interlocked.Exchange(ref firstServerFrame, 1) == 0, cts.Token))
     };
 
     if (captureReplies)
     {
-        sniffer = new ReplySniffer(IPAddress.Loopback, gamePort, knownClients, tunnel, proxyServer, cipher, cts.Token);
+        sniffer = new ReplySniffer(IPAddress.Loopback, gamePort, knownClients, tunnel, proxyServer, cipher, stats, cts.Token);
         tasks.Add(Task.Run(sniffer.Run));
     }
 
@@ -140,6 +259,7 @@ static async Task RunAsync(
     }
     finally
     {
+        stats.Print("прокси-клиент");
         sniffer?.Dispose();
         aliases.Dispose();
         Console.WriteLine("Прокси-клиент остановлен.");
@@ -153,6 +273,8 @@ static async Task ReceiveLoop(
     ConcurrentDictionary<IPEndPoint, DateTime> knownClients,
     ConcurrentDictionary<IPAddress, DateTime> activeIps,
     TunnelCipher? cipher,
+    TunnelStats stats,
+    Func<bool> reportFirstFrame,
     CancellationToken ct)
 {
     while (!ct.IsCancellationRequested)
@@ -180,16 +302,31 @@ static async Task ReceiveLoop(
         if (frameType == Frame.TypeData && cipher != null)
         {
             Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Получен незашифрованный кадр, но шифрование включено. Проверьте ключ у прокси-сервера.");
+            Interlocked.Increment(ref stats.BadFrames);
             continue;
         }
         if (frameType == Frame.TypeDataEncrypted && cipher == null)
         {
             Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Получен зашифрованный кадр, но ключ не задан. Запустите с тем же ключом, что и прокси-сервер.");
+            Interlocked.Increment(ref stats.BadFrames);
+            continue;
+        }
+        if (frameType is Frame.TypePing or Frame.TypePong)
+        {
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [диагностика] Служебный кадр 0x{frameType:X2} на порту туннеля — игнорирую.");
             continue;
         }
 
         if (!Frame.TryDecodeData(result.Buffer, result.Buffer.Length, cipher, out var clientIp, out ushort clientPort, out var payload))
+        {
+            Interlocked.Increment(ref stats.BadFrames);
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Не удалось разобрать кадр ({result.Buffer.Length} байт).");
             continue;
+        }
+
+        Interlocked.Increment(ref stats.PacketsIn);
+        if (reportFirstFrame())
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [диагностика] Получен первый кадр туннеля от прокси-сервера — канал работает.");
 
         Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [клиент ->] {clientIp}:{clientPort} ({payload.Length} байт)");
 
@@ -198,6 +335,7 @@ static async Task ReceiveLoop(
         activeIps[clientIp] = DateTime.UtcNow;
 
         injector.Inject(clientIp, clientPort, payload);
+        Interlocked.Increment(ref stats.Injected);
     }
 }
 

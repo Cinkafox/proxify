@@ -65,6 +65,21 @@ public static class NetUtils
     }
 
     /// <summary>
+    /// Разбирает порт: целое число от 1 до 65535.
+    /// </summary>
+    public static bool TryParsePort(string? text, out int port)
+    {
+        if (int.TryParse(text, out int value) && value is >= 1 and <= 65535)
+        {
+            port = value;
+            return true;
+        }
+
+        port = 0;
+        return false;
+    }
+
+    /// <summary>
     /// Пытается разобрать булев флаг из строки.
     /// </summary>
     public static bool TryParseBool(string? text, bool defaultValue)

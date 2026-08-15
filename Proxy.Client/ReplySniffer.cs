@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
+using System.Threading;
 using Proxify.Common;
 
 namespace Proxify.Client;
@@ -22,6 +23,7 @@ public sealed class ReplySniffer : IDisposable
     private readonly UdpClient _tunnel;
     private readonly IPEndPoint _proxyServer;
     private readonly TunnelCipher? _cipher;
+    private readonly TunnelStats _stats;
     private readonly CancellationToken _cancellationToken;
     private readonly byte[] _buffer = new byte[65535];
 
@@ -32,6 +34,7 @@ public sealed class ReplySniffer : IDisposable
         UdpClient tunnel,
         IPEndPoint proxyServer,
         TunnelCipher? cipher,
+        TunnelStats stats,
         CancellationToken cancellationToken)
     {
         _knownClients = knownClients;
@@ -39,6 +42,7 @@ public sealed class ReplySniffer : IDisposable
         _tunnel = tunnel;
         _proxyServer = proxyServer;
         _cipher = cipher;
+        _stats = stats;
         _cancellationToken = cancellationToken;
 
         _socket = PlatformSockets.CreateSnifferSocket();
@@ -85,11 +89,13 @@ public sealed class ReplySniffer : IDisposable
                 continue;
 
             Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [сервер ->] {client} ({payload.Length} байт)");
+            Interlocked.Increment(ref _stats.RepliesCaptured);
             var frame = Frame.EncodeData(dstIp, dstPort, payload, _cipher);
 
             try
             {
                 _tunnel.Send(frame, _proxyServer);
+                Interlocked.Increment(ref _stats.PacketsOut);
             }
             catch (SocketException ex)
             {

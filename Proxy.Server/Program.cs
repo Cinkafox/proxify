@@ -1,16 +1,31 @@
-﻿using System.Net;
+﻿using System.Collections.Concurrent;
+using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Threading;
 using Proxify.Common;
 
 Console.OutputEncoding = Encoding.UTF8;
 
 PrintUsage();
 
-int listenPort = args.Length > 0 && int.TryParse(args[0], out int lp) ? lp : 27015;
-IPEndPoint proxyClient = NetUtils.TryParseEndpoint(args.Length > 1 ? args[1] : null, out var pc)
-    ? pc
-    : new IPEndPoint(IPAddress.Loopback, 5600);
+int listenPort = 27015;
+if (args.Length > 0 && !NetUtils.TryParsePort(args[0], out listenPort))
+{
+    Console.WriteLine($"[ошибка конфигурации] Порт прослушивания '{args[0]}' не является допустимым (ожидается число от 1 до 65535).");
+    return 1;
+}
+
+IPEndPoint proxyClient = new IPEndPoint(IPAddress.Loopback, 5600);
+if (args.Length > 1)
+{
+    if (!NetUtils.TryParseEndpoint(args[1], out var pc))
+    {
+        Console.WriteLine($"[ошибка конфигурации] Адрес прокси-клиента '{args[1]}' не распознан (ожидается 'ip:port').");
+        return 1;
+    }
+    proxyClient = pc;
+}
 
 string? key = args.Length > 2 ? args[2] : null;
 TunnelCipher? cipher = string.IsNullOrEmpty(key) ? null : TunnelCipher.FromPassphrase(key);
@@ -21,8 +36,16 @@ Console.WriteLine($"Прокси-клиент (машина B)  : {proxyClient}"
 Console.WriteLine($"Шифрование туннеля        : {(cipher != null ? "вкл (AES-256-GCM)" : "выкл")}");
 Console.WriteLine();
 
+var stats = new TunnelStats();
+var seenClients = new ConcurrentDictionary<IPEndPoint, byte>();
+int proxyClientContacted = 0;
+
 using var udp = new UdpClient(new IPEndPoint(IPAddress.Any, listenPort));
+using var statsTimer = new Timer(_ => stats.Print("прокси-сервер"), null, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(1));
+
 Console.WriteLine("Ожидание пакетов от клиентов игры...");
+Console.WriteLine("При запуске прокси-клиент отправит PING — сервер ответит PONG и выведет");
+Console.WriteLine("диагностику первого контакта.");
 Console.WriteLine();
 
 while (true)
@@ -45,7 +68,88 @@ while (true)
         break;
     }
 
-    _ = HandlePacket(udp, result.RemoteEndPoint, result.Buffer, proxyClient, cipher);
+    _ = HandlePacket(result.RemoteEndPoint, result.Buffer);
+}
+
+return 0;
+
+async Task HandlePacket(IPEndPoint from, byte[] data)
+{
+    try
+    {
+        byte? frameType = Frame.PeekFrameType(data, data.Length);
+
+        // --- Служебные кадры диагностики (PING/PONG) ---
+        if (frameType == Frame.TypePing)
+        {
+            if (Frame.TryDecodeControl(data, data.Length, Frame.TypePing, cipher, out var token))
+            {
+                Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [диагностика] PING от {from} — прокси-клиент на связи.");
+                await udp.SendAsync(Frame.EncodeControl(Frame.TypePong, token, cipher), from);
+                Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [диагностика] PONG отправлен {from}.");
+            }
+            else
+            {
+                Interlocked.Increment(ref stats.BadFrames);
+                Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] PING от {from} не разобран (возможно, несовпадение ключа).");
+            }
+            return;
+        }
+        if (frameType == Frame.TypePong)
+        {
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [диагностика] Неожиданный PONG от {from} — игнорирую.");
+            return;
+        }
+
+        if (from.Equals(proxyClient))
+        {
+            // Кадр от прокси-клиента (ответ игрового сервера) -> переслать реальному клиенту.
+            if (Interlocked.Exchange(ref proxyClientContacted, 1) == 0)
+                Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [диагностика] Первый кадр от прокси-клиента {from}.");
+
+            if (frameType == Frame.TypeData && cipher != null)
+            {
+                Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Получен незашифрованный кадр, но шифрование включено. Проверьте ключ у прокси-клиента.");
+                Interlocked.Increment(ref stats.BadFrames);
+                return;
+            }
+            if (frameType == Frame.TypeDataEncrypted && cipher == null)
+            {
+                Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Получен зашифрованный кадр, но ключ не задан. Запустите с тем же ключом, что и прокси-клиент.");
+                Interlocked.Increment(ref stats.BadFrames);
+                return;
+            }
+
+            if (Frame.TryDecodeData(data, data.Length, cipher, out var clientIp, out ushort clientPort, out var payload))
+            {
+                var target = new IPEndPoint(clientIp, clientPort);
+                Interlocked.Increment(ref stats.PacketsIn);
+                Interlocked.Increment(ref stats.RepliesRelayed);
+                Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [ответ ->] {target} ({payload.Length} байт)");
+                await udp.SendAsync(payload, target);
+            }
+            else
+            {
+                Interlocked.Increment(ref stats.BadFrames);
+                Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Не удалось разобрать кадр от {from}.");
+            }
+        }
+        else
+        {
+            // Пакет от реального клиента -> завернуть в кадр и отправить прокси-клиенту.
+            if (seenClients.TryAdd(from, 0))
+                Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [диагностика] Новый игрок подключился: {from}.");
+            Interlocked.Increment(ref stats.PacketsIn);
+            Interlocked.Increment(ref stats.PacketsOut);
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [клиент ->] {from} ({data.Length} байт)");
+            var frame = Frame.EncodeData(from.Address, (ushort)from.Port, data, cipher);
+            await udp.SendAsync(frame, proxyClient);
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [ошибка] {ex.Message}");
+    }
 }
 
 static void PrintUsage()
@@ -59,48 +163,7 @@ static void PrintUsage()
     Console.WriteLine("  key                     - ключ шифрования (одинаковый у сервера и клиента). Если задан -");
     Console.WriteLine("                            кадры туннеля шифруются AES-256-GCM; если нет - без шифрования.");
     Console.WriteLine();
-}
-
-static async Task HandlePacket(UdpClient udp, IPEndPoint from, byte[] data, IPEndPoint proxyClient, TunnelCipher? cipher)
-{
-    try
-    {
-        if (from.Equals(proxyClient))
-        {
-            // Кадр от прокси-клиента (ответ игрового сервера) -> переслать реальному клиенту.
-            byte? frameType = Frame.PeekFrameType(data, data.Length);
-            if (frameType == Frame.TypeData && cipher != null)
-            {
-                Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Получен незашифрованный кадр, но шифрование включено. Проверьте ключ у прокси-клиента.");
-                return;
-            }
-            if (frameType == Frame.TypeDataEncrypted && cipher == null)
-            {
-                Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Получен зашифрованный кадр, но ключ не задан. Запустите с тем же ключом, что и прокси-клиент.");
-                return;
-            }
-
-            if (Frame.TryDecodeData(data, data.Length, cipher, out var clientIp, out ushort clientPort, out var payload))
-            {
-                var target = new IPEndPoint(clientIp, clientPort);
-                Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [ответ ->] {target} ({payload.Length} байт)");
-                await udp.SendAsync(payload, target);
-            }
-            else
-            {
-                Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Не удалось разобрать кадр от {from}.");
-            }
-        }
-        else
-        {
-            // Пакет от реального клиента -> завернуть в кадр и отправить прокси-клиенту.
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [клиент ->] {from} ({data.Length} байт)");
-            var frame = Frame.EncodeData(from.Address, (ushort)from.Port, data, cipher);
-            await udp.SendAsync(frame, proxyClient);
-        }
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [ошибка] {ex.Message}");
-    }
+    Console.WriteLine("При запуске прокси-клиент выполняет PING/PONG — сервер подтверждает связь и");
+    Console.WriteLine("выводит диагностику первого контакта. Раз в минуту печатается статистика [stats].");
+    Console.WriteLine();
 }
