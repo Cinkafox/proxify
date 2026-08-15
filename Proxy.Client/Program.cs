@@ -9,8 +9,8 @@ using Proxify.Common;
 Console.OutputEncoding = Encoding.UTF8;
 
 var cli = new ArgParser("Proxy.Client")
-    .Add("server", "Адрес прокси-сервера (машина A) в виде ip:port", required: true, shortName: 's')
-    .Add("tunnel-port", "Локальный UDP-порт туннеля", required: true, shortName: 't')
+    .Add("server", "IP или имя хоста прокси-сервера (машина A). Трафик туннеля уходит на его --tunnel-port", required: true, shortName: 's')
+    .Add("tunnel-port", "UDP-порт туннеля ПРОКСИ-СЕРВЕРА (машины A); должен совпадать с --tunnel-port сервера", required: true, shortName: 't')
     .Add("game-ip", "IP игрового сервера, обычно 127.0.0.1", shortName: 'g', defaultValue: "127.0.0.1")
     .Add("game-port", "UDP-порт игрового сервера", defaultValue: "7777")
     .Add("capture", "Перехватывать ответы игрового сервера (true/false)", defaultValue: "true")
@@ -26,18 +26,27 @@ if (!cli.TryParse(args))
 if (cli.HelpRequested)
     return 0;
 
-IPEndPoint proxyServer;
-if (!NetUtils.TryParseEndpoint(cli.Get("server"), out proxyServer))
+string serverHost = cli.Get("server")!;
+if (string.IsNullOrWhiteSpace(serverHost))
 {
-    Console.WriteLine($"[ошибка конфигурации] '--server {cli.Get("server")}' не распознан (ожидается 'ip:port').");
+    Console.WriteLine("[ошибка конфигурации] '--server' не может быть пустым (ожидается IP или имя хоста машины A).");
     cli.PrintUsage();
     return 1;
 }
 
-int tunnelBindPort;
-if (!NetUtils.TryParsePort(cli.Get("tunnel-port"), out tunnelBindPort))
+int tunnelPort;
+if (!NetUtils.TryParsePort(cli.Get("tunnel-port"), out tunnelPort))
 {
     Console.WriteLine($"[ошибка конфигурации] '--tunnel-port {cli.Get("tunnel-port")}' не является допустимым (ожидается число от 1 до 65535).");
+    cli.PrintUsage();
+    return 1;
+}
+
+// Адрес прокси-сервера: хост из --server, порт туннеля из --tunnel-port.
+IPEndPoint proxyServer;
+if (!NetUtils.TryParseEndpoint($"{serverHost}:{tunnelPort}", out proxyServer))
+{
+    Console.WriteLine($"[ошибка конфигурации] Не удалось разрешить адрес прокси-сервера '{serverHost}'.");
     cli.PrintUsage();
     return 1;
 }
@@ -89,17 +98,23 @@ if (string.IsNullOrWhiteSpace(key))
 var cipher = TunnelCipher.FromPassphrase(key);
 
 Console.WriteLine("=== Прокси-клиент (RealIP) ===");
-Console.WriteLine($"Прокси-сервер (машина A) : {proxyServer}");
+Console.WriteLine($"Прокси-сервер (машина A) : {proxyServer} (порт туннеля)");
 Console.WriteLine($"Игровой сервер (локально): {gameIp}:{gamePort}");
-Console.WriteLine($"Порт туннеля            : {tunnelBindPort}");
+Console.WriteLine($"Порт туннеля            : {tunnelPort} (порт туннеля сервера)");
 Console.WriteLine($"Перехват ответов       : {(captureReplies ? "вкл" : "выкл")}");
 Console.WriteLine($"Loopback-алиасы        : {(loopbackAliases ? "вкл" : "выкл")}");
 Console.WriteLine("Шифрование туннеля      : вкл (AES-256-GCM)");
 Console.WriteLine();
+Console.WriteLine("Локальный порт туннеля выбирается автоматически (эфемерный) — на машине B");
+Console.WriteLine("открывать порты не нужно: клиент сам устанавливает исходящее соединение");
+Console.WriteLine("на порт туннеля прокси-сервера.");
+Console.WriteLine();
 
 try
 {
-    using var tunnel = new UdpClient(new IPEndPoint(IPAddress.Any, tunnelBindPort));
+    using var tunnel = new UdpClient(new IPEndPoint(IPAddress.Any, 0));
+    int actualBindPort = ((IPEndPoint)tunnel.Client.LocalEndPoint!).Port;
+    Console.WriteLine($"[диагностика] Локальный порт туннеля: {actualBindPort}.");
     await HandshakeAsync(proxyServer, tunnel, cipher);
     await RunAsync(proxyServer, gameIp, (ushort)gamePort, tunnel, captureReplies, loopbackAliases, cipher);
 }

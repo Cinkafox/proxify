@@ -148,6 +148,8 @@ function Build-ControlFrame {
 # Запускает Proxy.Server, играет роль реального клиента и роль туннеля прокси-клиента.
 # Проверяет: клиент -> сервер -> кадр прокси-клиенту -> ответ серверу -> клиенту.
 # Шифрование AES-256-GCM обязательно (сервер не запускается без ключа).
+# Туннель теперь живёт на сервере: клиент шлёт кадры на его --tunnel-port,
+# а сам слушает эфемерный порт (как реальный прокси-клиент).
 
 $root = Split-Path -Parent $PSScriptRoot
 $serverDll = Join-Path $root "Proxy.Server\bin\Release\net8.0\Proxy.Server.dll"
@@ -157,29 +159,30 @@ if (-not (Test-Path $serverDll)) {
 }
 
 $listenPort = 27015
-$proxyClientPort = 5600
+$tunnelPort = 5600
 
 $cipherKey = Get-CipherKey $Key
 Write-Host "=== Тест туннеля (AES-256-GCM, ключ обязателен) ==="
 Write-Host ""
 
-$serverArgs = @($serverDll, "--port", "$listenPort", "--key", $Key)
+$serverArgs = @($serverDll, "--port", "$listenPort", "--tunnel-port", "$tunnelPort", "--key", $Key)
 
 $proc = Start-Process dotnet -ArgumentList $serverArgs -PassThru -NoNewWindow
 Start-Sleep -Milliseconds 1500
 
-$tunnel = New-Object System.Net.Sockets.UdpClient($proxyClientPort)
+$tunnel = New-Object System.Net.Sockets.UdpClient
 $client = New-Object System.Net.Sockets.UdpClient
 $client.Connect("127.0.0.1", $listenPort)
 
 try {
-    # 0. Эмуляция прокси-клиента: PING — сервер определяет адрес туннеля
+    # 0. Эмуляция прокси-клиента: PING на порт туннеля СЕРВЕРА — сервер определяет адрес туннеля
     $pingToken = New-Object byte[] 16
     $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
     try { $rng.GetBytes($pingToken) } finally { $rng.Dispose() }
     $ping = Build-ControlFrame -Type 3 -Body $pingToken -Key $cipherKey
-    [void]$tunnel.Send($ping, $ping.Length, "127.0.0.1", $listenPort)
-    Write-Host "[0] Прокси-клиент отправил PING — сервер определяет адрес туннеля"
+    [void]$tunnel.Send($ping, $ping.Length, "127.0.0.1", $tunnelPort)
+    Write-Host "Прокси-клиент (эмуляция): локальный порт туннеля $($tunnel.Client.LocalEndPoint.Port) (эфемерный)"
+    Write-Host "[0] Прокси-клиент отправил PING на порт туннеля сервера 127.0.0.1:$tunnelPort"
 
     $tunnel.Client.ReceiveTimeout = 3000
     $ep = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
@@ -194,7 +197,7 @@ try {
     [void]$client.Send($payload, $payload.Length)
     Write-Host "[1] Клиент отправил 'HELLO' на 127.0.0.1:$listenPort"
 
-    # 2. Прокси-сервер должен доставить кадр на туннель (порт 5600)
+    # 2. Прокси-сервер должен доставить кадр на туннель прокси-клиента (эфемерный порт)
     $frame = $tunnel.Receive([ref]$ep)
 
     $decoded = Decode-OuterFrame -Frame $frame -Key $cipherKey
@@ -205,11 +208,11 @@ try {
     }
     Write-Host "    OK: кадр закодирован верно, настоящий адрес клиента сохранён."
 
-    # 3. Эмулируем прокси-клиента: отвечаем кадром обратно на прокси-сервер
+    # 3. Эмулируем прокси-клиента: отвечаем кадром обратно на порт туннеля сервера
     $reply = [Text.Encoding]::UTF8.GetBytes("REPLY")
     $rf = Build-OuterFrame -ClientIp $decoded.ClientIp -ClientPort $decoded.ClientPort -Payload $reply -Key $cipherKey
-    [void]$tunnel.Send($rf, $rf.Length, "127.0.0.1", $listenPort)
-    Write-Host "[3] Эмуляция прокси-клиента отправила кадр-ответ на 127.0.0.1:$listenPort"
+    [void]$tunnel.Send($rf, $rf.Length, "127.0.0.1", $tunnelPort)
+    Write-Host "[3] Эмуляция прокси-клиента отправила кадр-ответ на порт туннеля сервера 127.0.0.1:$tunnelPort"
 
     # 4. Реальный клиент должен получить ответ от прокси-сервера
     $client.Client.ReceiveTimeout = 3000
