@@ -1,0 +1,70 @@
+# ============================================================================
+# ПРИМЕР 1: локальная проверка — всё на одной машине.
+#
+#   node-a — публичный прокси-сервер (машина A)
+#   node-b — прокси-клиент + игровой UDP-сервер (машина B)
+#
+# Запуск:
+#   docker compose -f docker-compose.local.yml up -d --build
+#
+# Проверка с хоста (PowerShell): шлём "HELLO" на публичный порт, ждём ответ.
+#   $c = New-Object System.Net.Sockets.UdpClient
+#   $c.Connect("127.0.0.1", 27015)
+#   [void]$c.Send([Text.Encoding]::UTF8.GetBytes("HELLO"), 5)
+#   $ep = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
+#   [Text.Encoding]::UTF8.GetString($c.Receive([ref]$ep))   # -> "HELLO"
+#
+# В логе node-b (docker compose logs -f node-b) игровой сервер покажет пакет
+# с source = IP хоста в NAT-сети Docker (172.30.0.1), а не с адреса контейнера
+# node-a — это и есть «настоящий IP клиента» через туннель.
+#
+# Ключ шифрования берётся из переменной окружения KEY или .env-файла.
+#   $env:KEY = "my-secret"; docker compose -f docker-compose.local.yml up -d --build
+# ============================================================================
+
+services:
+  node-a:                       # машина A — публичный прокси-сервер
+    build:
+      context: .
+      target: server
+    command:
+      # [порт игроков] [прокси-клиент:порт туннеля] [ключ]
+      # Используем статические IP, чтобы не зависеть от тайминга DNS.
+      - "27015"
+      - "172.30.0.11:5600"
+      - "${KEY:-example-secret-key}"
+    ports:
+      - "27015:27015/udp"       # сюда подключаются игроки
+    networks:
+      pxnet:
+        ipv4_address: 172.30.0.10
+    restart: unless-stopped
+
+  node-b:                       # машина B — прокси-клиент + игровой сервер
+    build:
+      context: .
+      target: client
+    entrypoint: ["/app/machine-b-entrypoint.sh"]   # поднимает игровой сервер и клиента
+    command:
+      # [прокси-сервер:порт] [gameIp] [gamePort] [порт туннеля] [перехват] [алиасы] [ключ]
+      - "172.30.0.10:27015"
+      - "127.0.0.1"             # игровой сервер в этом же контейнере
+      - "7777"
+      - "5600"
+      - "true"                  # перехватывать ответы игрового сервера
+      - "true"                  # добавлять IP игроков на lo (ip addr add)
+      - "${KEY:-example-secret-key}"
+    cap_add:
+      - NET_RAW                 # raw-сокеты (впрыск пакетов, сниффер)
+      - NET_ADMIN               # ip addr add/del на loopback
+    networks:
+      pxnet:
+        ipv4_address: 172.30.0.11
+    restart: unless-stopped
+
+networks:
+  pxnet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24

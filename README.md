@@ -139,6 +139,49 @@ pwsh scripts\test-tunnel.ps1 -Key "my-secret-key"
 dotnet run --project Proxy.SelfTest -c Release
 ```
 
+## Docker (docker-compose)
+
+В репозитории есть готовые примеры для развёртывания в Docker:
+
+| Файл | Сценарий |
+|------|----------|
+| `docker-compose.local.yml` | Обе машины (A и B) на одной машине — быстрая проверка. |
+| `docker-compose.machine-a.yml` | Только прокси-сервер (машина A). |
+| `docker-compose.machine-b.yml` | Прокси-клиент + игровой сервер (машина B). |
+
+Образ `client` собирается с игровым UDP-сервером-эхом
+(`docker/gamesrv.py`, порт `7777`) — замените его своим сервером, но
+запускайте его **в том же контейнере/сетевом пространстве**, что и
+`Proxy.Client` (см. `docker/machine-b-entrypoint.sh`), иначе ответы сервера
+не попадут в перехватчик на loopback.
+
+Ключ шифрования задаётся переменной окружения `KEY` (или `.env`-файлом):
+
+```powershell
+# Локальная проверка всего туннеля:
+$env:KEY = "my-secret"
+docker compose -f docker-compose.local.yml up -d --build
+# с хоста: отправить "HELLO" на 127.0.0.1:27015/udp, в ответ — "HELLO"
+docker compose -f docker-compose.local.yml logs -f node-b   # GOT <IP игрока>
+docker compose -f docker-compose.local.yml down -v
+```
+
+Две машины:
+
+```powershell
+# На машине A:
+$env:MACHINE_B_IP = "5.5.5.5"; $env:KEY = "my-secret"
+docker compose -f docker-compose.machine-a.yml up -d --build
+
+# На машине B (игровой сервер):
+$env:MACHINE_A_IP = "1.2.3.4"; $env:KEY = "my-secret"   # тот же ключ!
+docker compose -f docker-compose.machine-b.yml up -d --build
+```
+
+`proxyclient` (машина B) требует `NET_RAW` и `NET_ADMIN` — они уже указаны в
+compose-файлах. Откройте на файрволе: порт игроков `27015/udp` (машина A) и
+порт туннеля `5600/udp` (машина B).
+
 ## Формат кадра туннеля (big endian)
 
 Незашифрованный кадр:
@@ -199,4 +242,8 @@ Proxy.Client/RawInjector.cs  RawSocket-впрыск с настоящим IP (IP
 Proxy.Client/ReplySniffer.cs перехват ответов и возврат в туннель
 Proxy.SelfTest/Program.cs    самопроверка
 scripts/test-tunnel.ps1      интеграционный тест туннеля
+Dockerfile                   трёхстадийная сборка образов server/client
+docker/gamesrv.py            игровой UDP-сервер-эхо для примера (порт 7777)
+docker/machine-b-entrypoint.sh  старт игрового сервера и прокси-клиента в контейнере
+docker-compose.*.yml         примеры развёртывания (см. раздел «Docker»)
 ```

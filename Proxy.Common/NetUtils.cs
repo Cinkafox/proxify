@@ -27,7 +27,7 @@ public static class NetUtils
     }
 
     /// <summary>
-    /// Разбирает строку вида "ip:port".
+    /// Разбирает строку вида "ip:port" (поддерживаются и DNS-имена хостов).
     /// </summary>
     public static bool TryParseEndpoint(string? text, out IPEndPoint endpoint)
     {
@@ -39,8 +39,23 @@ public static class NetUtils
         if (parts.Length != 2)
             return false;
 
-        if (!IPAddress.TryParse(parts[0], out var ip))
-            return false;
+        IPAddress ip;
+        if (!IPAddress.TryParse(parts[0], out ip!))
+        {
+            // Хостнейм (например, имя сервиса docker-compose): резолвим через DNS.
+            try
+            {
+                var resolved = Dns.GetHostAddresses(parts[0])
+                    .FirstOrDefault(a => a.AddressFamily == AddressFamily.InterNetwork);
+                if (resolved == null)
+                    return false;
+                ip = resolved;
+            }
+            catch (SocketException)
+            {
+                return false;
+            }
+        }
 
         if (!int.TryParse(parts[1], out int port) || port < 1 || port > 65535)
             return false;
