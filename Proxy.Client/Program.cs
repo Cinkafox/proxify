@@ -3,7 +3,6 @@ using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
-using System.Threading;
 using Proxify.Client;
 using Proxify.Common;
 
@@ -11,12 +10,12 @@ Console.OutputEncoding = Encoding.UTF8;
 
 var cli = new ArgParser("Proxy.Client")
     .Add("server", "Адрес прокси-сервера (машина A) в виде ip:port", required: true, shortName: 's')
-    .Add("tunnel-port", "Локальный UDP-порт туннеля (должен совпадать с портом в --client на сервере)", required: true, shortName: 't')
+    .Add("tunnel-port", "Локальный UDP-порт туннеля", required: true, shortName: 't')
     .Add("game-ip", "IP игрового сервера, обычно 127.0.0.1", shortName: 'g', defaultValue: "127.0.0.1")
     .Add("game-port", "UDP-порт игрового сервера", defaultValue: "7777")
     .Add("capture", "Перехватывать ответы игрового сервера (true/false)", defaultValue: "true")
     .Add("aliases", "Добавлять IP клиентов в loopback-алиасы (true/false)", defaultValue: "true")
-    .Add("key", "Ключ шифрования (одинаковый у сервера и клиента). Если задан — кадры шифруются AES-256-GCM", shortName: 'k');
+    .Add("key", "Ключ шифрования (одинаковый у сервера и клиента). Обязателен — кадры всегда шифруются AES-256-GCM", required: true, shortName: 'k');
 
 if (!cli.TryParse(args))
 {
@@ -79,8 +78,15 @@ if (!bool.TryParse(cli.Get("aliases"), out bool loopbackAliases))
     return 1;
 }
 
-string? key = cli.Get("key");
-TunnelCipher? cipher = string.IsNullOrEmpty(key) ? null : TunnelCipher.FromPassphrase(key);
+string key = cli.Get("key")!;
+if (string.IsNullOrWhiteSpace(key))
+{
+    Console.WriteLine("[ошибка конфигурации] '--key' не может быть пустым.");
+    cli.PrintUsage();
+    return 1;
+}
+
+var cipher = TunnelCipher.FromPassphrase(key);
 
 Console.WriteLine("=== Прокси-клиент (RealIP) ===");
 Console.WriteLine($"Прокси-сервер (машина A) : {proxyServer}");
@@ -88,13 +94,14 @@ Console.WriteLine($"Игровой сервер (локально): {gameIp}:{ga
 Console.WriteLine($"Порт туннеля            : {tunnelBindPort}");
 Console.WriteLine($"Перехват ответов       : {(captureReplies ? "вкл" : "выкл")}");
 Console.WriteLine($"Loopback-алиасы        : {(loopbackAliases ? "вкл" : "выкл")}");
-Console.WriteLine($"Шифрование туннеля      : {(cipher != null ? "вкл (AES-256-GCM)" : "выкл")}");
+Console.WriteLine("Шифрование туннеля      : вкл (AES-256-GCM)");
 Console.WriteLine();
 
 try
 {
-    await HandshakeAsync(proxyServer, cipher);
-    await RunAsync(proxyServer, gameIp, (ushort)gamePort, tunnelBindPort, captureReplies, loopbackAliases, cipher);
+    using var tunnel = new UdpClient(new IPEndPoint(IPAddress.Any, tunnelBindPort));
+    await HandshakeAsync(proxyServer, tunnel, cipher);
+    await RunAsync(proxyServer, gameIp, (ushort)gamePort, tunnel, captureReplies, loopbackAliases, cipher);
 }
 catch (SocketException ex) when (ex.SocketErrorCode == SocketError.AccessDenied)
 {
@@ -119,16 +126,16 @@ catch (Exception ex)
 return 0;
 
 /// Проверка связи с прокси-сервером: отправляет PING (3 попытки по 2 с) и ждёт PONG.
+/// PING уходит с туннельного сокета — сервер по нему определяет адрес туннеля.
 /// Работает даже при несовпадении ключа — сервер ответит «не разобранным» PING,
 /// и клиент это увидит в логе сервера. При неудаче клиент всё равно продолжает работу.
-static async Task<bool> HandshakeAsync(IPEndPoint proxyServer, TunnelCipher? cipher)
+static async Task<bool> HandshakeAsync(IPEndPoint proxyServer, UdpClient socket, TunnelCipher? cipher)
 {
     Console.WriteLine("[диагностика] Проверка связи с прокси-сервером (PING/PONG)...");
 
     var token = Guid.NewGuid().ToByteArray();
     var ping = Frame.EncodeControl(Frame.TypePing, token, cipher);
 
-    using var socket = new UdpClient();
     socket.Client.ReceiveTimeout = 2000;
 
     for (int attempt = 1; attempt <= 3; attempt++)
@@ -183,7 +190,7 @@ static async Task<bool> HandshakeAsync(IPEndPoint proxyServer, TunnelCipher? cip
     Console.WriteLine("[!] Связь с прокси-сервером не установлена. Проверьте:");
     Console.WriteLine("[!]   1) прокси-сервер запущен и слушает UDP-порт (по умолчанию 27015);");
     Console.WriteLine("[!]   2) файрвол машины A пропускает UDP-трафик на порт туннеля;");
-    Console.WriteLine("[!]   3) ключ шифрования совпадает у сервера и клиента (если используется).");
+    Console.WriteLine("[!]   3) ключ шифрования совпадает у сервера и клиента.");
     Console.WriteLine("[!] Прокси-клиент продолжит работу и выведет [диагностика], как только получит первый кадр.");
     return false;
 }
@@ -192,7 +199,7 @@ static async Task RunAsync(
     IPEndPoint proxyServer,
     IPAddress gameIp,
     ushort gamePort,
-    int tunnelBindPort,
+    UdpClient tunnel,
     bool captureReplies,
     bool loopbackAliases,
     TunnelCipher? cipher)
@@ -211,14 +218,14 @@ static async Task RunAsync(
 
     var aliases = new LoopbackAliasManager(loopbackAliases);
     using var injector = new RawInjector(gameIp, gamePort);
-    using var tunnel = new UdpClient(new IPEndPoint(IPAddress.Any, tunnelBindPort));
     using var statsTimer = new Timer(_ => stats.Print("прокси-клиент"), null, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(1));
 
     ReplySniffer? sniffer = null;
     var tasks = new List<Task>
     {
         Task.Run(() => ReceiveLoop(tunnel, aliases, injector, knownClients, activeIps, cipher, stats,
-            () => Interlocked.Exchange(ref firstServerFrame, 1) == 0, cts.Token))
+            () => Interlocked.Exchange(ref firstServerFrame, 1) == 0, cts.Token)),
+        Task.Run(() => HeartbeatLoop(tunnel, proxyServer, cipher, cts.Token))
     };
 
     if (captureReplies)
@@ -247,6 +254,39 @@ static async Task RunAsync(
         sniffer?.Dispose();
         aliases.Dispose();
         Console.WriteLine("Прокси-клиент остановлен.");
+    }
+}
+
+/// Сердцебиение: раз в 10 секунд отправляет прокси-серверу PING с туннельного
+/// сокета. Сервер по нему определяет/обновляет адрес туннеля — связь восстанавливается
+/// сама после перезапуска сервера, смены порта после NAT или неудачного стартового PING.
+static async Task HeartbeatLoop(UdpClient tunnel, IPEndPoint proxyServer, TunnelCipher? cipher, CancellationToken ct)
+{
+    var ping = Frame.EncodeControl(Frame.TypePing, Guid.NewGuid().ToByteArray(), cipher);
+
+    while (!ct.IsCancellationRequested)
+    {
+        try
+        {
+            await tunnel.SendAsync(ping, ping.Length, proxyServer);
+        }
+        catch (SocketException)
+        {
+            // сервер временно недоступен — повторим через интервал
+        }
+        catch (ObjectDisposedException)
+        {
+            break;
+        }
+
+        try
+        {
+            await Task.Delay(TimeSpan.FromSeconds(10), ct);
+        }
+        catch (OperationCanceledException)
+        {
+            break;
+        }
     }
 }
 
@@ -289,15 +329,9 @@ static async Task ReceiveLoop(
             Interlocked.Increment(ref stats.BadFrames);
             continue;
         }
-        if (frameType == Frame.TypeDataEncrypted && cipher == null)
-        {
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Получен зашифрованный кадр, но ключ не задан. Запустите с тем же ключом, что и прокси-сервер.");
-            Interlocked.Increment(ref stats.BadFrames);
-            continue;
-        }
         if (frameType is Frame.TypePing or Frame.TypePong)
         {
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [диагностика] Служебный кадр 0x{frameType:X2} на порту туннеля — игнорирую.");
+            // служебные кадры (в т.ч. ответы на сердцебиение) — не трафик
             continue;
         }
 
