@@ -171,8 +171,8 @@ if ($encrypted) {
 }
 Write-Host ""
 
-$serverArgs = @($serverDll, "$listenPort", "127.0.0.1:$proxyClientPort")
-if ($encrypted) { $serverArgs += $Key }
+$serverArgs = @($serverDll, "--port", "$listenPort", "--client", "127.0.0.1:$proxyClientPort")
+if ($encrypted) { $serverArgs += @("--key", $Key) }
 
 $proc = Start-Process dotnet -ArgumentList $serverArgs -PassThru -NoNewWindow
 Start-Sleep -Milliseconds 1500

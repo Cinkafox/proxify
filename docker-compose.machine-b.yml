@@ -24,13 +24,21 @@ services:
       target: client
     entrypoint: ["/app/machine-b-entrypoint.sh"]   # поднимает игровой сервер и клиента
     command:
-      # [прокси-сервер:порт] [gameIp] [gamePort] [порт туннеля] [перехват] [алиасы] [ключ]
+      # --server [прокси-сервер:порт] --tunnel-port [порт туннеля] --game-ip --game-port
+      #            --capture true/false --aliases true/false --key
+      - "--server"
       - "${MACHINE_A_IP:-1.2.3.4}:27015"
-      - "127.0.0.1"             # игровой сервер в этом же контейнере
-      - "7777"
+      - "--tunnel-port"
       - "5600"
+      - "--game-ip"
+      - "127.0.0.1"             # игровой сервер в этом же контейнере
+      - "--game-port"
+      - "7777"
+      - "--capture"
       - "true"                  # перехватывать ответы игрового сервера
+      - "--aliases"
       - "true"                  # добавлять IP игроков на lo (ip addr add)
+      - "--key"
       - "${KEY:-example-secret-key}"
     cap_add:
       - NET_RAW                 # raw-сокеты (впрыск пакетов, сниффер)

@@ -7,27 +7,37 @@ using Proxify.Common;
 
 Console.OutputEncoding = Encoding.UTF8;
 
-PrintUsage();
+var cli = new ArgParser("Proxy.Server")
+    .Add("port", "UDP-порт, на который подключаются клиенты игры", required: true, shortName: 'p')
+    .Add("client", "Адрес прокси-клиента (машина B) в виде ip:port", required: true, shortName: 'c')
+    .Add("key", "Ключ шифрования (одинаковый у сервера и клиента). Если задан — кадры шифруются AES-256-GCM", shortName: 'k');
 
-int listenPort = 27015;
-if (args.Length > 0 && !NetUtils.TryParsePort(args[0], out listenPort))
+if (!cli.TryParse(args))
 {
-    Console.WriteLine($"[ошибка конфигурации] Порт прослушивания '{args[0]}' не является допустимым (ожидается число от 1 до 65535).");
+    Console.WriteLine($"[ошибка конфигурации] {cli.Error}");
+    cli.PrintUsage();
+    return 1;
+}
+if (cli.HelpRequested)
+    return 0;
+
+int listenPort;
+if (!NetUtils.TryParsePort(cli.Get("port"), out listenPort))
+{
+    Console.WriteLine($"[ошибка конфигурации] '--port {cli.Get("port")}' не является допустимым (ожидается число от 1 до 65535).");
+    cli.PrintUsage();
     return 1;
 }
 
-IPEndPoint proxyClient = new IPEndPoint(IPAddress.Loopback, 5600);
-if (args.Length > 1)
+IPEndPoint proxyClient;
+if (!NetUtils.TryParseEndpoint(cli.Get("client"), out proxyClient))
 {
-    if (!NetUtils.TryParseEndpoint(args[1], out var pc))
-    {
-        Console.WriteLine($"[ошибка конфигурации] Адрес прокси-клиента '{args[1]}' не распознан (ожидается 'ip:port').");
-        return 1;
-    }
-    proxyClient = pc;
+    Console.WriteLine($"[ошибка конфигурации] '--client {cli.Get("client")}' не распознан (ожидается 'ip:port').");
+    cli.PrintUsage();
+    return 1;
 }
 
-string? key = args.Length > 2 ? args[2] : null;
+string? key = cli.Get("key");
 TunnelCipher? cipher = string.IsNullOrEmpty(key) ? null : TunnelCipher.FromPassphrase(key);
 
 Console.WriteLine("=== Прокси-сервер (RealIP) ===");
@@ -150,20 +160,4 @@ async Task HandlePacket(IPEndPoint from, byte[] data)
     {
         Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [ошибка] {ex.Message}");
     }
-}
-
-static void PrintUsage()
-{
-    Console.WriteLine("Прокси-сервер: перенаправляет UDP-трафик клиентов игры прокси-клиенту,");
-    Console.WriteLine("сохраняя настоящий IP клиента (подмена выполняется прокси-клиентом).");
-    Console.WriteLine();
-    Console.WriteLine("Использование: Proxy.Server [listenPort] [proxyClientIp:proxyClientPort] [key]");
-    Console.WriteLine("  listenPort              - порт, на который подключаются клиенты игры (по умолч. 27015)");
-    Console.WriteLine("  proxyClientIp:port      - адрес прокси-клиента на машине с игровым сервером (по умолч. 127.0.0.1:5600)");
-    Console.WriteLine("  key                     - ключ шифрования (одинаковый у сервера и клиента). Если задан -");
-    Console.WriteLine("                            кадры туннеля шифруются AES-256-GCM; если нет - без шифрования.");
-    Console.WriteLine();
-    Console.WriteLine("При запуске прокси-клиент выполняет PING/PONG — сервер подтверждает связь и");
-    Console.WriteLine("выводит диагностику первого контакта. Раз в минуту печатается статистика [stats].");
-    Console.WriteLine();
 }

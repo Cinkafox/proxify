@@ -9,64 +9,77 @@ using Proxify.Common;
 
 Console.OutputEncoding = Encoding.UTF8;
 
-PrintUsage();
+var cli = new ArgParser("Proxy.Client")
+    .Add("server", "Адрес прокси-сервера (машина A) в виде ip:port", required: true, shortName: 's')
+    .Add("tunnel-port", "Локальный UDP-порт туннеля (должен совпадать с портом в --client на сервере)", required: true, shortName: 't')
+    .Add("game-ip", "IP игрового сервера, обычно 127.0.0.1", shortName: 'g', defaultValue: "127.0.0.1")
+    .Add("game-port", "UDP-порт игрового сервера", defaultValue: "7777")
+    .Add("capture", "Перехватывать ответы игрового сервера (true/false)", defaultValue: "true")
+    .Add("aliases", "Добавлять IP клиентов в loopback-алиасы (true/false)", defaultValue: "true")
+    .Add("key", "Ключ шифрования (одинаковый у сервера и клиента). Если задан — кадры шифруются AES-256-GCM", shortName: 'k');
 
-IPEndPoint proxyServer = new IPEndPoint(IPAddress.Loopback, 27015);
-if (args.Length > 0)
+if (!cli.TryParse(args))
 {
-    if (!NetUtils.TryParseEndpoint(args[0], out var ps))
-    {
-        Console.WriteLine($"[ошибка конфигурации] Адрес прокси-сервера '{args[0]}' не распознан (ожидается 'ip:port').");
-        return 1;
-    }
-    proxyServer = ps;
+    Console.WriteLine($"[ошибка конфигурации] {cli.Error}");
+    cli.PrintUsage();
+    return 1;
+}
+if (cli.HelpRequested)
+    return 0;
+
+IPEndPoint proxyServer;
+if (!NetUtils.TryParseEndpoint(cli.Get("server"), out proxyServer))
+{
+    Console.WriteLine($"[ошибка конфигурации] '--server {cli.Get("server")}' не распознан (ожидается 'ip:port').");
+    cli.PrintUsage();
+    return 1;
 }
 
-IPAddress gameIp = IPAddress.Loopback;
-if (args.Length > 1)
+int tunnelBindPort;
+if (!NetUtils.TryParsePort(cli.Get("tunnel-port"), out tunnelBindPort))
 {
-    if (!IPAddress.TryParse(args[1], out var gi))
-    {
-        Console.WriteLine($"[ошибка конфигурации] gameIp '{args[1]}' не является IP-адресом.");
-        return 1;
-    }
-    gameIp = gi;
+    Console.WriteLine($"[ошибка конфигурации] '--tunnel-port {cli.Get("tunnel-port")}' не является допустимым (ожидается число от 1 до 65535).");
+    cli.PrintUsage();
+    return 1;
+}
+
+IPAddress gameIp;
+if (!IPAddress.TryParse(cli.Get("game-ip"), out gameIp!))
+{
+    Console.WriteLine($"[ошибка конфигурации] '--game-ip {cli.Get("game-ip")}' не является IP-адресом.");
+    cli.PrintUsage();
+    return 1;
 }
 if (gameIp.AddressFamily != AddressFamily.InterNetwork)
 {
-    Console.WriteLine("[ошибка конфигурации] gameIp должен быть IPv4-адресом.");
+    Console.WriteLine("[ошибка конфигурации] '--game-ip' должен быть IPv4-адресом.");
+    cli.PrintUsage();
     return 1;
 }
 
-int gamePort = 7777;
-if (args.Length > 2 && !NetUtils.TryParsePort(args[2], out gamePort))
+int gamePort;
+if (!NetUtils.TryParsePort(cli.Get("game-port"), out gamePort))
 {
-    Console.WriteLine($"[ошибка конфигурации] gamePort '{args[2]}' не является допустимым (ожидается число от 1 до 65535).");
+    Console.WriteLine($"[ошибка конфигурации] '--game-port {cli.Get("game-port")}' не является допустимым (ожидается число от 1 до 65535).");
+    cli.PrintUsage();
     return 1;
 }
 
-int tunnelBindPort = 5600;
-if (args.Length > 3 && !NetUtils.TryParsePort(args[3], out tunnelBindPort))
+if (!bool.TryParse(cli.Get("capture"), out bool captureReplies))
 {
-    Console.WriteLine($"[ошибка конфигурации] Порт туннеля '{args[3]}' не является допустимым (ожидается число от 1 до 65535).");
+    Console.WriteLine($"[ошибка конфигурации] '--capture {cli.Get("capture")}' должен быть true или false.");
+    cli.PrintUsage();
     return 1;
 }
 
-bool captureReplies = true;
-if (args.Length > 4 && !bool.TryParse(args[4], out captureReplies))
+if (!bool.TryParse(cli.Get("aliases"), out bool loopbackAliases))
 {
-    Console.WriteLine($"[ошибка конфигурации] captureReplies '{args[4]}' должен быть true или false.");
+    Console.WriteLine($"[ошибка конфигурации] '--aliases {cli.Get("aliases")}' должен быть true или false.");
+    cli.PrintUsage();
     return 1;
 }
 
-bool loopbackAliases = true;
-if (args.Length > 5 && !bool.TryParse(args[5], out loopbackAliases))
-{
-    Console.WriteLine($"[ошибка конфигурации] loopbackAliases '{args[5]}' должен быть true или false.");
-    return 1;
-}
-
-string? key = args.Length > 6 ? args[6] : null;
+string? key = cli.Get("key");
 TunnelCipher? cipher = string.IsNullOrEmpty(key) ? null : TunnelCipher.FromPassphrase(key);
 
 Console.WriteLine("=== Прокси-клиент (RealIP) ===");
@@ -105,34 +118,6 @@ catch (Exception ex)
 
 return 0;
 
-static void PrintUsage()
-{
-    Console.WriteLine("Прокси-клиент: принимает трафик от прокси-сервера и впрыскивает его");
-    Console.WriteLine("в локальный игровой UDP-сервер с подменённым (настоящим) IP клиента,");
-    Console.WriteLine("используя RawSocket. Ответы сервера перехватываются и возвращаются");
-    Console.WriteLine("клиенту через прокси-сервер.");
-    Console.WriteLine();
-    Console.WriteLine("Использование: Proxy.Client [proxyServerIp:proxyServerPort] [gameIp] [gamePort]");
-    Console.WriteLine("                        [tunnelBindPort] [captureReplies] [loopbackAliases] [key]");
-    Console.WriteLine("  proxyServerIp:port - адрес прокси-сервера на машине A (по умолч. 127.0.0.1:27015)");
-    Console.WriteLine("  gameIp             - IP игрового сервера, обычно 127.0.0.1 (по умолч. 127.0.0.1)");
-    Console.WriteLine("  gamePort           - UDP-порт игрового сервера (по умолч. 7777)");
-    Console.WriteLine("  tunnelBindPort     - локальный порт туннеля (по умолч. 5600)");
-    Console.WriteLine("  captureReplies     - перехватывать ответы сервера (true/false, по умолч. true)");
-    Console.WriteLine("  loopbackAliases    - добавлять IP клиентов в loopback-алиасы (true/false, по умолч. true)");
-    Console.WriteLine("  key                - ключ шифрования (одинаковый у сервера и клиента). Если задан -");
-    Console.WriteLine("                       кадры туннеля шифруются AES-256-GCM; если нет - без шифрования.");
-    Console.WriteLine();
-    Console.WriteLine("ВАЖНО: требуются права администратора (Windows) / root (Linux).");
-    Console.WriteLine("Игровой сервер должен быть");
-    Console.WriteLine("привязан к 0.0.0.0:{gamePort} (или 127.0.0.1:{gamePort}), чтобы видеть");
-    Console.WriteLine("подменённые пакеты с настоящими IP клиентов.");
-    Console.WriteLine();
-    Console.WriteLine("При запуске выполняется PING/PONG к прокси-серверу — результат связи");
-    Console.WriteLine("печатается как [диагностика]. Раз в минуту печатается статистика [stats].");
-    Console.WriteLine();
-}
-
 /// Проверка связи с прокси-сервером: отправляет PING (3 попытки по 2 с) и ждёт PONG.
 /// Работает даже при несовпадении ключа — сервер ответит «не разобранным» PING,
 /// и клиент это увидит в логе сервера. При неудаче клиент всё равно продолжает работу.
@@ -163,7 +148,6 @@ static async Task<bool> HandshakeAsync(IPEndPoint proxyServer, TunnelCipher? cip
         var deadline = DateTime.UtcNow.AddSeconds(2);
         while (DateTime.UtcNow < deadline)
         {
-            EndPoint ep = new IPEndPoint(IPAddress.Any, 0);
             byte[] resp;
             try
             {
