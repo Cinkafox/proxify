@@ -118,8 +118,11 @@ public sealed class LoopbackAliasManager : IDisposable
             _aliases[ip] = 0;
             Console.WriteLine($"[alias] Добавлен loopback-алиас {ip}/32");
         }
-        else if (stderr.Contains("File exists"))
+        else if (stderr.Contains("File exists") || stderr.Contains("Address already assigned"))
         {
+            // Адрес уже присутствует на lo: из предыдущего запуска или был назначен
+            // вручную. Это штатная ситуация — ответы игрового сервера всё равно
+            // маршрутизируются в loopback, алиас не будет удалён при остановке.
             Console.WriteLine($"[alias] Loopback-алиас {ip}/32 уже существует (не удаляется при остановке)");
         }
         else
