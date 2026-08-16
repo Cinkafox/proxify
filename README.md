@@ -437,7 +437,9 @@ Proxify.Common/
   ArgParser.cs             разбор аргументов --имя значение (обязательные/дефолты/--help)
   TunnelStats.cs           счётчики трафика и строка [stats]
   AsyncWorkQueue.cs        ограниченная очередь задач с пулом воркеров (параллельная обработка)
-Proxify.Server/ProxySession.cs    состояние и логика сессии прокси-сервера (Auth, циклы, TCP)
+Proxify.Server/ClientSession.cs    данные одного прокси-клиента (конфиг, ключ, сокеты, сессия туннеля)
+Proxify.Server/ProxySession.cs     обработка пакетов одного клиента (Auth, PING/PONG, UDP/TCP, циклы)
+Proxify.Server/ProxyServer.cs      общий туннельный сокет и диспетчеризация кадров по клиентам
 Proxify.Server/Program.cs     конфигурация и запуск прокси-сервера
 Proxify.Client/ProxySession.cs    состояние и логика сессии прокси-клиента (Auth/AuthAck, циклы)
 Proxify.Client/Program.cs     конфигурация и запуск прокси-клиента

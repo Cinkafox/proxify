@@ -60,14 +60,14 @@ foreach (var client in clients)
     }
 }
 
-using var session = new ProxySession(clients, tunnelPort);
-using var statsTimer = new Timer(_ => session.Stats.Print("прокси-сервер"), null, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(1));
+using var server = new ProxyServer(clients, tunnelPort);
+using var statsTimer = new Timer(_ => server.Stats.Print("прокси-сервер"), null, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(1));
 
-session.PrintBanner();
+server.PrintBanner();
 
 try
 {
-    await session.RunAsync();
+    await server.RunAsync();
 }
 catch (Exception ex)
 {
