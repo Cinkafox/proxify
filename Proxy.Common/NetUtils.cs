@@ -39,8 +39,7 @@ public static class NetUtils
         if (parts.Length != 2)
             return false;
 
-        IPAddress ip;
-        if (!IPAddress.TryParse(parts[0], out ip!))
+        if (!IPAddress.TryParse(parts[0], out var ip))
         {
             // Хостнейм (например, имя сервиса docker-compose): резолвим через DNS.
             try
@@ -57,7 +56,7 @@ public static class NetUtils
             }
         }
 
-        if (!int.TryParse(parts[1], out int port) || port < 1 || port > 65535)
+        if (!int.TryParse(parts[1], out var port) || port < 1 || port > 65535)
             return false;
 
         endpoint = new IPEndPoint(ip, port);
@@ -69,7 +68,7 @@ public static class NetUtils
     /// </summary>
     public static bool TryParsePort(string? text, out int port)
     {
-        if (int.TryParse(text, out int value) && value is >= 1 and <= 65535)
+        if (int.TryParse(text, out var value) && value is >= 1 and <= 65535)
         {
             port = value;
             return true;
@@ -86,6 +85,6 @@ public static class NetUtils
     {
         if (string.IsNullOrWhiteSpace(text))
             return defaultValue;
-        return bool.TryParse(text, out bool value) ? value : defaultValue;
+        return bool.TryParse(text, out var value) ? value : defaultValue;
     }
 }

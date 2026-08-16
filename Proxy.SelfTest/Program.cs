@@ -38,7 +38,7 @@ try
     Console.WriteLine($"[4] RawSocket-инжектор создан");
 
     // 5. Инжектируем пакет с подменённым источником
-    byte[] payload = Encoding.UTF8.GetBytes("Hello from spoofed client");
+    var payload = Encoding.UTF8.GetBytes("Hello from spoofed client");
     Console.WriteLine($"[5] Инжектируем пакет от {testClientIp}:{testClientPort} -> {gameIp}:{gamePort}");
     injector.Inject(testClientIp, (ushort)testClientPort, payload);
 
@@ -46,9 +46,9 @@ try
     Console.WriteLine("[6] Ждём пакет на игровом сервере...");
     using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
     var received = await gameServer.ReceiveAsync(cts.Token);
-    string receivedFrom = $"{received.RemoteEndPoint.Address}:{received.RemoteEndPoint.Port}";
-    string expectedFrom = $"{testClientIp}:{testClientPort}";
-    string body = Encoding.UTF8.GetString(received.Buffer);
+    var receivedFrom = $"{received.RemoteEndPoint.Address}:{received.RemoteEndPoint.Port}";
+    var expectedFrom = $"{testClientIp}:{testClientPort}";
+    var body = Encoding.UTF8.GetString(received.Buffer);
 
     Console.WriteLine($"    Получено от: {receivedFrom}, данные: {body}");
     if (receivedFrom == expectedFrom && body == "Hello from spoofed client")
@@ -131,8 +131,8 @@ internal sealed class SniffSocket : IDisposable
         while (true)
         {
             EndPoint from = new IPEndPoint(IPAddress.Any, 0);
-            int received = _socket.ReceiveFrom(buffer, ref from);
-            if (!Packets.TryParseUdp(buffer, received, out var srcIp, out var dstIp, out ushort srcPort, out ushort dstPort, out _))
+            var received = _socket.ReceiveFrom(buffer, ref from);
+            if (!Packets.TryParseUdp(buffer, received, out var srcIp, out var dstIp, out var srcPort, out var dstPort, out _))
                 continue;
 
             if (!IPAddress.IsLoopback(srcIp))

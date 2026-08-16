@@ -49,9 +49,9 @@ public sealed class ArgParser
         _values.Clear();
         _helpRequested = false;
 
-        for (int i = 0; i < args.Length; i++)
+        for (var i = 0; i < args.Length; i++)
         {
-            string a = args[i];
+            var a = args[i];
 
             if (a is "--help" or "-h")
             {
@@ -66,10 +66,10 @@ public sealed class ArgParser
                 return false;
             }
 
-            string body = a.TrimStart('-');
+            var body = a.TrimStart('-');
             string name;
             string? inlineValue = null;
-            int eq = body.IndexOf('=');
+            var eq = body.IndexOf('=');
             if (eq >= 0)
             {
                 name = body[..eq];
@@ -152,8 +152,8 @@ public sealed class ArgParser
         Console.WriteLine("Опции:");
         foreach (var o in _options)
         {
-            string shortPart = o.ShortName != '\0' ? $"-{o.ShortName}, " : "    ";
-            string suffix = (o.Required ? " (обязательный)" : "") + (o.Default != null ? $" (по умолч. {o.Default})" : "");
+            var shortPart = o.ShortName != '\0' ? $"-{o.ShortName}, " : "    ";
+            var suffix = (o.Required ? " (обязательный)" : "") + (o.Default != null ? $" (по умолч. {o.Default})" : "");
             Console.WriteLine($"  {shortPart}--{o.LongName}{suffix}");
             Console.WriteLine($"      {o.Help}");
         }

@@ -53,7 +53,7 @@ public static class Frame
 
         var encrypted = cipher.Wrap(inner);
         var frame = new byte[HeaderLength + encrypted.Length];
-        int o = 0;
+        var o = 0;
         WriteU16(frame, ref o, Magic);
         frame[o++] = TypeDataEncrypted;
         encrypted.CopyTo(frame.AsSpan(o));
@@ -74,11 +74,11 @@ public static class Frame
         if (buffer == null || length < HeaderLength)
             return false;
 
-        int o = 0;
+        var o = 0;
         if (ReadU16(buffer, ref o) != Magic)
             return false;
 
-        byte type = buffer[o++];
+        var type = buffer[o++];
         if (type == TypeData)
         {
             return TryDecodeDataFrame(buffer, length, out clientIp, out clientPort, out payload);
@@ -107,7 +107,7 @@ public static class Frame
         if (buffer == null || length < HeaderLength)
             return null;
 
-        int o = 0;
+        var o = 0;
         if (ReadU16(buffer, ref o) != Magic)
             return null;
 
@@ -121,7 +121,7 @@ public static class Frame
     {
         var body = cipher != null ? cipher.Wrap(payload) : payload;
         var frame = new byte[HeaderLength + body.Length];
-        int o = 0;
+        var o = 0;
         WriteU16(frame, ref o, Magic);
         frame[o++] = type;
         body.CopyTo(frame.AsSpan(o));
@@ -140,7 +140,7 @@ public static class Frame
         if (buffer == null || length < HeaderLength)
             return false;
 
-        int o = 0;
+        var o = 0;
         if (ReadU16(buffer, ref o) != Magic)
             return false;
 
@@ -164,7 +164,7 @@ public static class Frame
             throw new ArgumentException("Поддерживается только IPv4.", nameof(clientIp));
 
         var frame = new byte[InnerHeaderLength + payload.Length];
-        int o = 0;
+        var o = 0;
 
         WriteU16(frame, ref o, Magic);
         frame[o++] = TypeData;
@@ -188,7 +188,7 @@ public static class Frame
         if (buffer == null || length < InnerHeaderLength)
             return false;
 
-        int o = 0;
+        var o = 0;
         if (ReadU16(buffer, ref o) != Magic)
             return false;
 
@@ -213,7 +213,7 @@ public static class Frame
 
     private static ushort ReadU16(byte[] buffer, ref int offset)
     {
-        ushort value = (ushort)((buffer[offset] << 8) | buffer[offset + 1]);
+        var value = (ushort)((buffer[offset] << 8) | buffer[offset + 1]);
         offset += 2;
         return value;
     }

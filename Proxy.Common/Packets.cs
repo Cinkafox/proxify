@@ -21,8 +21,8 @@ public static class Packets
         ushort sourcePort, ushort destinationPort,
         ReadOnlySpan<byte> payload, ushort ipId)
     {
-        int udpLength = UdpHeaderLength + payload.Length;
-        int totalLength = IpHeaderLength + udpLength;
+        var udpLength = UdpHeaderLength + payload.Length;
+        var totalLength = IpHeaderLength + udpLength;
 
         var packet = new byte[totalLength];
 
@@ -46,7 +46,7 @@ public static class Packets
         Array.Copy(d, 0, packet, 16, 4);               // destination IP
 
         // --- UDP header ---
-        int u = IpHeaderLength;
+        var u = IpHeaderLength;
         packet[u + 0] = (byte)(sourcePort >> 8);       // source port
         packet[u + 1] = (byte)sourcePort;
         packet[u + 2] = (byte)(destinationPort >> 8);  // destination port
@@ -58,11 +58,11 @@ public static class Packets
 
         payload.CopyTo(packet.AsSpan(u + UdpHeaderLength));
 
-        ushort ipChecksum = Checksum.Ip(packet.AsSpan(0, IpHeaderLength));
+        var ipChecksum = Checksum.Ip(packet.AsSpan(0, IpHeaderLength));
         packet[10] = (byte)(ipChecksum >> 8);
         packet[11] = (byte)ipChecksum;
 
-        ushort udpChecksum = Checksum.Udp(sourceIp, destinationIp, (ushort)udpLength, packet.AsSpan(u, udpLength));
+        var udpChecksum = Checksum.Udp(sourceIp, destinationIp, (ushort)udpLength, packet.AsSpan(u, udpLength));
         packet[u + 6] = (byte)(udpChecksum >> 8);
         packet[u + 7] = (byte)udpChecksum;
 
@@ -90,7 +90,7 @@ public static class Packets
         if ((buffer[0] >> 4) != 4)
             return false;
 
-        int ipHeaderLength = (buffer[0] & 0x0F) * 4;
+        var ipHeaderLength = (buffer[0] & 0x0F) * 4;
         if (ipHeaderLength < IpHeaderLength || length < ipHeaderLength + UdpHeaderLength)
             return false;
 
@@ -104,12 +104,12 @@ public static class Packets
         sourceIp = new IPAddress(s);
         destinationIp = new IPAddress(d);
 
-        int u = ipHeaderLength;
+        var u = ipHeaderLength;
         sourcePort = (ushort)((buffer[u] << 8) | buffer[u + 1]);
         destinationPort = (ushort)((buffer[u + 2] << 8) | buffer[u + 3]);
-        int udpLength = (buffer[u + 4] << 8) | buffer[u + 5];
+        var udpLength = (buffer[u + 4] << 8) | buffer[u + 5];
 
-        int available = length - (u + UdpHeaderLength);
+        var available = length - (u + UdpHeaderLength);
         if (udpLength - UdpHeaderLength > available || udpLength < UdpHeaderLength)
             return false;
 

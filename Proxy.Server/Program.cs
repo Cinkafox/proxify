@@ -20,16 +20,14 @@ if (!cli.TryParse(args))
 if (cli.HelpRequested)
     return 0;
 
-int listenPort;
-if (!NetUtils.TryParsePort(cli.Get("port"), out listenPort))
+if (!NetUtils.TryParsePort(cli.Get("port"), out var listenPort))
 {
     Console.WriteLine($"[ошибка конфигурации] '--port {cli.Get("port")}' не является допустимым (ожидается число от 1 до 65535).");
     cli.PrintUsage();
     return 1;
 }
 
-int tunnelPort;
-if (!NetUtils.TryParsePort(cli.Get("tunnel-port"), out tunnelPort))
+if (!NetUtils.TryParsePort(cli.Get("tunnel-port"), out var tunnelPort))
 {
     Console.WriteLine($"[ошибка конфигурации] '--tunnel-port {cli.Get("tunnel-port")}' не является допустимым (ожидается число от 1 до 65535).");
     cli.PrintUsage();
@@ -43,7 +41,7 @@ if (tunnelPort == listenPort)
     return 1;
 }
 
-string key = cli.Get("key")!;
+var key = cli.Get("key")!;
 if (string.IsNullOrWhiteSpace(key))
 {
     Console.WriteLine("[ошибка конфигурации] '--key' не может быть пустым.");
@@ -175,8 +173,8 @@ async Task HandlePlayerPacket(IPEndPoint from, byte[] data)
         var proxyClientEndpoint = CurrentProxyClient();
         if (proxyClientEndpoint == null)
         {
-            long nowTicks = DateTime.UtcNow.Ticks;
-            long prev = Interlocked.Read(ref lastNoClientLogTicks);
+            var nowTicks = DateTime.UtcNow.Ticks;
+            var prev = Interlocked.Read(ref lastNoClientLogTicks);
             if (nowTicks - prev >= TimeSpan.FromSeconds(5).Ticks)
             {
                 Interlocked.CompareExchange(ref lastNoClientLogTicks, nowTicks, prev);
@@ -203,7 +201,7 @@ async Task HandleTunnelFrame(IPEndPoint from, byte[] data)
 {
     try
     {
-        byte? frameType = Frame.PeekFrameType(data, data.Length);
+        var frameType = Frame.PeekFrameType(data, data.Length);
 
         // --- Служебные кадры диагностики (PING/PONG) ---
         if (frameType == Frame.TypePing)
@@ -235,7 +233,7 @@ async Task HandleTunnelFrame(IPEndPoint from, byte[] data)
                 return;
             }
 
-            if (Frame.TryDecodeData(data, data.Length, cipher, out var clientIp, out ushort clientPort, out var payload))
+            if (Frame.TryDecodeData(data, data.Length, cipher, out var clientIp, out var clientPort, out var payload))
             {
                 LearnProxyClient(from);
                 var target = new IPEndPoint(clientIp, clientPort);

@@ -26,7 +26,7 @@ if (!cli.TryParse(args))
 if (cli.HelpRequested)
     return 0;
 
-string serverHost = cli.Get("server")!;
+var serverHost = cli.Get("server")!;
 if (string.IsNullOrWhiteSpace(serverHost))
 {
     Console.WriteLine("[ошибка конфигурации] '--server' не может быть пустым (ожидается IP или имя хоста машины A).");
@@ -34,8 +34,7 @@ if (string.IsNullOrWhiteSpace(serverHost))
     return 1;
 }
 
-int tunnelPort;
-if (!NetUtils.TryParsePort(cli.Get("tunnel-port"), out tunnelPort))
+if (!NetUtils.TryParsePort(cli.Get("tunnel-port"), out var tunnelPort))
 {
     Console.WriteLine($"[ошибка конфигурации] '--tunnel-port {cli.Get("tunnel-port")}' не является допустимым (ожидается число от 1 до 65535).");
     cli.PrintUsage();
@@ -43,16 +42,14 @@ if (!NetUtils.TryParsePort(cli.Get("tunnel-port"), out tunnelPort))
 }
 
 // Адрес прокси-сервера: хост из --server, порт туннеля из --tunnel-port.
-IPEndPoint proxyServer;
-if (!NetUtils.TryParseEndpoint($"{serverHost}:{tunnelPort}", out proxyServer))
+if (!NetUtils.TryParseEndpoint($"{serverHost}:{tunnelPort}", out var proxyServer))
 {
     Console.WriteLine($"[ошибка конфигурации] Не удалось разрешить адрес прокси-сервера '{serverHost}'.");
     cli.PrintUsage();
     return 1;
 }
 
-IPAddress gameIp;
-if (!IPAddress.TryParse(cli.Get("game-ip"), out gameIp!))
+if (!IPAddress.TryParse(cli.Get("game-ip"), out var gameIp))
 {
     Console.WriteLine($"[ошибка конфигурации] '--game-ip {cli.Get("game-ip")}' не является IP-адресом.");
     cli.PrintUsage();
@@ -65,29 +62,28 @@ if (gameIp.AddressFamily != AddressFamily.InterNetwork)
     return 1;
 }
 
-int gamePort;
-if (!NetUtils.TryParsePort(cli.Get("game-port"), out gamePort))
+if (!NetUtils.TryParsePort(cli.Get("game-port"), out var gamePort))
 {
     Console.WriteLine($"[ошибка конфигурации] '--game-port {cli.Get("game-port")}' не является допустимым (ожидается число от 1 до 65535).");
     cli.PrintUsage();
     return 1;
 }
 
-if (!bool.TryParse(cli.Get("capture"), out bool captureReplies))
+if (!bool.TryParse(cli.Get("capture"), out var captureReplies))
 {
     Console.WriteLine($"[ошибка конфигурации] '--capture {cli.Get("capture")}' должен быть true или false.");
     cli.PrintUsage();
     return 1;
 }
 
-if (!bool.TryParse(cli.Get("aliases"), out bool loopbackAliases))
+if (!bool.TryParse(cli.Get("aliases"), out var loopbackAliases))
 {
     Console.WriteLine($"[ошибка конфигурации] '--aliases {cli.Get("aliases")}' должен быть true или false.");
     cli.PrintUsage();
     return 1;
 }
 
-string key = cli.Get("key")!;
+var key = cli.Get("key")!;
 if (string.IsNullOrWhiteSpace(key))
 {
     Console.WriteLine("[ошибка конфигурации] '--key' не может быть пустым.");
@@ -112,9 +108,7 @@ Console.WriteLine();
 
 try
 {
-    using var tunnel = new UdpClient(new IPEndPoint(IPAddress.Any, 0));
-    int actualBindPort = ((IPEndPoint)tunnel.Client.LocalEndPoint!).Port;
-    Console.WriteLine($"[диагностика] Локальный порт туннеля: {actualBindPort}.");
+    using var tunnel = new UdpClient();
     await HandshakeAsync(proxyServer, tunnel, cipher);
     await RunAsync(proxyServer, gameIp, (ushort)gamePort, tunnel, captureReplies, loopbackAliases, cipher);
 }
@@ -153,7 +147,7 @@ static async Task<bool> HandshakeAsync(IPEndPoint proxyServer, UdpClient socket,
 
     socket.Client.ReceiveTimeout = 2000;
 
-    for (int attempt = 1; attempt <= 3; attempt++)
+    for (var attempt = 1; attempt <= 3; attempt++)
     {
         var sw = Stopwatch.StartNew();
         try
@@ -166,7 +160,7 @@ static async Task<bool> HandshakeAsync(IPEndPoint proxyServer, UdpClient socket,
             continue;
         }
 
-        bool timeout = true;
+        var timeout = true;
         var deadline = DateTime.UtcNow.AddSeconds(2);
         while (DateTime.UtcNow < deadline)
         {
@@ -229,7 +223,7 @@ static async Task RunAsync(
     var knownClients = new ConcurrentDictionary<IPEndPoint, DateTime>();
     var activeIps = new ConcurrentDictionary<IPAddress, DateTime>();
     var stats = new TunnelStats();
-    int firstServerFrame = 0;
+    var firstServerFrame = 0;
 
     var aliases = new LoopbackAliasManager(loopbackAliases);
     using var injector = new RawInjector(gameIp, gamePort);
@@ -337,7 +331,7 @@ static async Task ReceiveLoop(
             continue;
         }
 
-        byte? frameType = Frame.PeekFrameType(result.Buffer, result.Buffer.Length);
+        var frameType = Frame.PeekFrameType(result.Buffer, result.Buffer.Length);
         if (frameType == Frame.TypeData && cipher != null)
         {
             Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Получен незашифрованный кадр, но шифрование включено. Проверьте ключ у прокси-сервера.");
@@ -350,7 +344,7 @@ static async Task ReceiveLoop(
             continue;
         }
 
-        if (!Frame.TryDecodeData(result.Buffer, result.Buffer.Length, cipher, out var clientIp, out ushort clientPort, out var payload))
+        if (!Frame.TryDecodeData(result.Buffer, result.Buffer.Length, cipher, out var clientIp, out var clientPort, out var payload))
         {
             Interlocked.Increment(ref stats.BadFrames);
             Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Не удалось разобрать кадр ({result.Buffer.Length} байт).");
@@ -378,7 +372,7 @@ static void CleanupLoop(
     ConcurrentDictionary<IPAddress, DateTime> activeIps,
     CancellationToken ct)
 {
-    TimeSpan idleTimeout = TimeSpan.FromMinutes(10);
+    var idleTimeout = TimeSpan.FromMinutes(10);
 
     while (!ct.IsCancellationRequested)
     {

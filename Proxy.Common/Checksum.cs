@@ -10,7 +10,7 @@ public static class Checksum
     public static ushort Ip(ReadOnlySpan<byte> header)
     {
         uint sum = 0;
-        for (int i = 0; i + 1 < header.Length; i += 2)
+        for (var i = 0; i + 1 < header.Length; i += 2)
             sum += (uint)((header[i] << 8) | header[i + 1]);
 
         sum = Fold(sum);
@@ -30,7 +30,7 @@ public static class Checksum
         sum += Packets.ProtoUdp;
         sum += udpLength;
 
-        int i = 0;
+        var i = 0;
         for (; i + 1 < udp.Length; i += 2)
             sum += (uint)((udp[i] << 8) | udp[i + 1]);
 

@@ -75,7 +75,7 @@ public sealed class ReplySniffer : IDisposable
                 break;
             }
 
-            if (!Packets.TryParseUdp(_buffer, received, out var srcIp, out var dstIp, out ushort srcPort, out ushort dstPort, out var payload))
+            if (!Packets.TryParseUdp(_buffer, received, out var srcIp, out var dstIp, out var srcPort, out var dstPort, out var payload))
                 continue;
 
             // Ответ игрового сервера: source port = порт игры. Источник не обязан быть

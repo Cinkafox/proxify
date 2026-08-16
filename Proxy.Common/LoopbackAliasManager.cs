@@ -67,12 +67,12 @@ public sealed class LoopbackAliasManager : IDisposable
 
         lock (_lock)
         {
-            if (!_aliases.TryRemove(ip, out uint context))
+            if (!_aliases.TryRemove(ip, out var context))
                 return;
 
             if (_isWindows)
             {
-                uint error = DeleteIPAddress(context);
+                var error = DeleteIPAddress(context);
                 if (error != 0 && error != ErrorNotSupported)
                     Console.WriteLine($"[alias] Не удалось удалить {ip}: Win32 error {error}");
             }
@@ -87,12 +87,12 @@ public sealed class LoopbackAliasManager : IDisposable
 
     private void AddWindows(IPAddress ip)
     {
-        uint? ifIndex = GetLoopbackIfIndex();
+        var ifIndex = GetLoopbackIfIndex();
         if (ifIndex == null)
             return;
 
-        uint address = ToNetworkOrder(ip);
-        uint error = AddIPAddress(address, 0xFFFFFFFF, ifIndex.Value, out uint context, out _);
+        var address = ToNetworkOrder(ip);
+        var error = AddIPAddress(address, 0xFFFFFFFF, ifIndex.Value, out var context, out _);
 
         if (error == 0)
         {
@@ -143,7 +143,7 @@ public sealed class LoopbackAliasManager : IDisposable
             if (proc == null)
                 return (-1, "не удалось запустить команду 'ip'");
 
-            string stderr = proc.StandardError.ReadToEnd();
+            var stderr = proc.StandardError.ReadToEnd();
             if (!proc.WaitForExit(5000))
             {
                 proc.Kill(entireProcessTree: true);
@@ -164,7 +164,7 @@ public sealed class LoopbackAliasManager : IDisposable
             return _loopbackIfIndex;
 
         // Интерфейс, на котором находится 127.0.0.1, — это loopback-интерфейс.
-        uint error = GetBestInterface(0x7F000001, out uint ifIndex);
+        var error = GetBestInterface(0x7F000001, out var ifIndex);
         if (error != 0)
         {
             Console.WriteLine($"[alias] GetBestInterface: Win32 error {error}");
