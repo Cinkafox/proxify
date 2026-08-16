@@ -254,9 +254,12 @@ public sealed class TcpRelay : IDisposable
             }
             finally
             {
-                // Ждём подтверждения всех отправленных данных, чтобы последние байты
-                // ответа игрового сервера не потерялись из-за потери последнего кадра.
-                _sender.WaitDrained(TimeSpan.FromMilliseconds(500));
+                // Хвост большого ответа игрового сервера может ещё не быть подтверждён
+                // (окно неподтверждённых кадров заполнено): пока кадры не подтверждены,
+                // повторная передача по таймеру продолжается. TcpClose отправляется ТОЛЬКО
+                // после полного подтверждения, иначе лаунчер увидит обрезанный ответ.
+                // (таймаут защищает от зависания при фактически мёртвой сети)
+                _sender.WaitDrained(TimeSpan.FromSeconds(10));
                 SendClose();
                 Close();
                 _relay.OnSessionClosed(_connId);
@@ -368,13 +371,23 @@ public sealed class TcpRelay : IDisposable
             if (cipher == null)
                 return;
 
-            try
+            // TcpClose — «управляющий» кадр без подтверждения: на линиях с потерями
+            // датаграмма может пропасть, поэтому отправляем несколько раз (повторы
+            // на принимающей стороне идемпотентны).
+            var frame = Frame.EncodeTcpClose(_connId, cipher);
+            for (var i = 0; i < 3; i++)
             {
-                _tunnel.Send(Frame.EncodeTcpClose(_connId, cipher), _proxyServer);
-            }
-            catch (Exception)
-            {
-                // сокет туннеля может быть уже закрыт — игнорируем
+                try
+                {
+                    _tunnel.Send(frame, _proxyServer);
+                }
+                catch (Exception)
+                {
+                    // сокет туннеля может быть уже закрыт — игнорируем
+                    break;
+                }
+                if (i < 2)
+                    Thread.Sleep(30);
             }
         }
 

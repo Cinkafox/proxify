@@ -49,7 +49,10 @@ public sealed class TcpFrameBatcher : IDisposable
     private int _timerActive;
     private volatile bool _disposed;
 
-    /// <param name="sendFrame">Вызывается на каждый готовый кадр (однократно, вне блокировки).</param>
+    /// <param name="sendFrame">Вызывается на каждый готовый кадр. ВАЖНО: вызывается
+    /// внутри внутренней блокировки батчера и строго в порядке следования байт —
+    /// обратный вызов должен присваивать порядковые номера в порядке вызова
+    /// (как TcpReliableSender.Send), иначе поток будет переставлен.</param>
     /// <param name="maxFramePayload">Максимальный размер полезной нагрузки кадра.</param>
     /// <param name="nagleDelay">Задержка объединения мелких фрагментов; null — значение по умолчанию.</param>
     public TcpFrameBatcher(
@@ -107,10 +110,16 @@ public sealed class TcpFrameBatcher : IDisposable
                     // граница чанка chunked-кодирования / строка SSE — отправляем поток сразу
                     toSend = GrabAll();
                 }
-            }
 
-            if (toSend.Length > 0)
-                _sendFrame(toSend);
+                // Отправка выполняется ВНУТРИ блокировки: иначе таймер (Flush/Complete)
+                // может обогнать цикл чтения и вызвать sendFrame для более поздних байт
+                // раньше, чем для более ранних, а отправитель (TcpReliableSender.Send)
+                // назначит порядковые номера в порядке вызова — получится перестановка
+                // кадров в доставленном потоке. Блокировка sendFrame на полном окне —
+                // штатное обратное давление (цикл чтения приостанавливается).
+                if (toSend.Length > 0)
+                    _sendFrame(toSend);
+            }
         }
 
         // Остаток меньше размера кадра (после дробления больших порций или тихий
@@ -134,15 +143,12 @@ public sealed class TcpFrameBatcher : IDisposable
     /// </summary>
     public void Flush()
     {
-        byte[] toSend = Array.Empty<byte>();
         lock (_sync)
         {
             _timerActive = 0;
             if (_count > 0)
-                toSend = GrabAll();
+                _sendFrame(GrabAll());
         }
-        if (toSend.Length > 0)
-            _sendFrame(toSend);
     }
 
     /// <summary>
@@ -151,15 +157,12 @@ public sealed class TcpFrameBatcher : IDisposable
     /// </summary>
     public void Complete()
     {
-        byte[] toSend = Array.Empty<byte>();
         lock (_sync)
         {
             _disposed = true;
             if (_count > 0)
-                toSend = GrabAll();
+                _sendFrame(GrabAll());
         }
-        if (toSend.Length > 0)
-            _sendFrame(toSend);
     }
 
     public void Dispose() => Complete();

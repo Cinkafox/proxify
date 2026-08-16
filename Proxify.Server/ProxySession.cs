@@ -367,9 +367,10 @@ public sealed class ProxySession : IDisposable
         }
         finally
         {
-            // Ждём подтверждения всех отправленных данных, чтобы последние байты
-            // ответа не потерялись из-за потери последнего кадра.
-            sender.WaitDrained(TimeSpan.FromMilliseconds(500));
+            // Аналогично клиенту: закрытие (TcpClose) отправляется только после полного
+            // подтверждения всех отправленных кадров, чтобы последние байты запроса/ответа
+            // не потерялись на реальной сети с потерями.
+            sender.WaitDrained(TimeSpan.FromSeconds(10));
             await CloseTcpWithRemoteAsync(connId);
         }
     }
@@ -406,7 +407,15 @@ public sealed class ProxySession : IDisposable
 
         try
         {
-            await _tunnel.SendAsync(Frame.EncodeTcpClose(connId, cipher), proxy);
+            // TcpClose — управляющий кадр без подтверждения: дублируем, чтобы потеря
+            // единственной датаграммы не оставила висящее соединение (повторы идемпотентны).
+            var frame = Frame.EncodeTcpClose(connId, cipher);
+            for (var i = 0; i < 3; i++)
+            {
+                await _tunnel.SendAsync(frame, proxy);
+                if (i < 2)
+                    await Task.Delay(30);
+            }
             Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [tcp] Соединение {connId} закрыто, прокси-клиент уведомлён.");
         }
         catch (Exception ex)

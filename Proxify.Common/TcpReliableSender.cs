@@ -24,6 +24,8 @@ public sealed class TcpReliableSender : IDisposable
     private long _nextSeq;
     private Timer? _timer;
     private bool _closed;
+    private int _retransmitIntervalMs;
+    private int _unackedAtLastFire = -1;
 
     /// <summary>Максимум неподтверждённых блоков, после которого передача приостанавливается.</summary>
     public int MaxBufferedFrames { get; }
@@ -39,6 +41,7 @@ public sealed class TcpReliableSender : IDisposable
         _sendFrame = sendFrame;
         MaxBufferedFrames = maxBufferedFrames;
         _retransmitInterval = retransmitInterval ?? TimeSpan.FromMilliseconds(50);
+        _retransmitIntervalMs = Math.Max(1, (int)_retransmitInterval.TotalMilliseconds);
     }
 
     /// <summary>
@@ -69,9 +72,9 @@ public sealed class TcpReliableSender : IDisposable
     private void ArmTimerLocked()
     {
         if (_timer == null)
-            _timer = new Timer(_ => Retransmit(), null, _retransmitInterval, _retransmitInterval);
+            _timer = new Timer(_ => Retransmit(), null, _retransmitIntervalMs, _retransmitIntervalMs);
         else
-            _timer.Change(_retransmitInterval, _retransmitInterval);
+            _timer.Change(_retransmitIntervalMs, _retransmitIntervalMs);
     }
 
     /// <summary>
@@ -84,11 +87,19 @@ public sealed class TcpReliableSender : IDisposable
             if (_closed)
                 return;
 
+            var removed = 0;
             while (_unacked.Count > 0 && _unacked.First!.Value.Seq < ackSeq)
+            {
                 _unacked.RemoveFirst();
+                removed++;
+            }
+
+            // Есть прогресс — канал жив, возвращаем минимальный интервал повтора.
+            if (removed > 0)
+                _retransmitIntervalMs = Math.Max(1, (int)_retransmitInterval.TotalMilliseconds);
 
             if (_unacked.Count > 0 && _timer != null)
-                _timer.Change(_retransmitInterval, _retransmitInterval);
+                _timer.Change(_retransmitIntervalMs, _retransmitIntervalMs);
             else if (_timer != null)
                 _timer.Change(Timeout.Infinite, Timeout.Infinite);
 
@@ -138,8 +149,19 @@ public sealed class TcpReliableSender : IDisposable
             if (_closed || _unacked.Count == 0)
                 return;
 
+            // Адаптивный интервал повторной передачи: если с прошлого срабатывания ни один
+            // кадр не был подтверждён, канал насыщен/потерян — разредить поток дубликатов,
+            // иначе на медленной линии повторы сами вызывают потери и ACK не успевают дойти.
+            if (_unackedAtLastFire >= 0 && _unacked.Count >= _unackedAtLastFire)
+                _retransmitIntervalMs = Math.Min(_retransmitIntervalMs * 2, 1000);
+            else
+                _retransmitIntervalMs = Math.Max(1, (int)_retransmitInterval.TotalMilliseconds);
+            _unackedAtLastFire = _unacked.Count;
+
             foreach (var item in _unacked)
                 SendFrameLocked(item.Seq, item.Payload);
+
+            _timer?.Change(_retransmitIntervalMs, _retransmitIntervalMs);
         }
     }
 
