@@ -299,6 +299,19 @@ public sealed class ProxySession : IDisposable
         try
         {
             var stream = tcpClient.GetStream();
+            using var batcher = new TcpFrameBatcher(data =>
+            {
+                var proxy = _client.TunnelEndpoint;
+                var cipher = _client.Cipher;
+                if (proxy == null || cipher == null)
+                    return;
+
+                Interlocked.Increment(ref _stats.PacketsIn);
+                Interlocked.Increment(ref _stats.PacketsOut);
+                var frame = Frame.EncodeTcpData(connId, data, cipher);
+                _tunnel.Send(frame, proxy);
+            });
+
             var buffer = new byte[16384];
             while (true)
             {
@@ -319,16 +332,9 @@ public sealed class ProxySession : IDisposable
                 if (read <= 0)
                     break;
 
-                var proxy = _client.TunnelEndpoint;
-                var cipher = _client.Cipher;
-                if (proxy == null || cipher == null)
-                    continue;
-
-                Interlocked.Increment(ref _stats.PacketsIn);
-                Interlocked.Increment(ref _stats.PacketsOut);
-                var frame = Frame.EncodeTcpData(connId, buffer.AsSpan(0, read), cipher);
-                await _tunnel.SendAsync(frame, proxy);
+                batcher.Append(buffer.AsSpan(0, read));
             }
+            batcher.Complete();
         }
         catch (Exception ex)
         {

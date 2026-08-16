@@ -205,6 +205,7 @@ public sealed class TcpRelay : IDisposable
                 client = new TcpClient();
                 using var connectCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
                 await client.ConnectAsync(_gameIp, _gamePort, connectCts.Token);
+                client.NoDelay = true;
                 stream = client.GetStream();
                 _client = client;
                 _stream = stream;
@@ -259,8 +260,32 @@ public sealed class TcpRelay : IDisposable
 
         private async Task ReaderLoopAsync(NetworkStream stream)
         {
+            var sendFailed = false;
+            using var batcher = new TcpFrameBatcher(data =>
+            {
+                var cipher = _cipherGetter();
+                if (cipher == null)
+                {
+                    sendFailed = true;
+                    return;
+                }
+
+                var frame = Frame.EncodeTcpData(_connId, data, cipher);
+                try
+                {
+                    _tunnel.Send(frame, _proxyServer);
+                    Interlocked.Increment(ref _stats.PacketsOut);
+                    Interlocked.Increment(ref _stats.RepliesRelayed);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [tcp] Ошибка отправки (connId {_connId}): {ex.Message}");
+                    sendFailed = true;
+                }
+            });
+
             var buffer = new byte[16384];
-            while (true)
+            while (!sendFailed)
             {
                 int read;
                 try
@@ -279,23 +304,9 @@ public sealed class TcpRelay : IDisposable
                 if (read <= 0)
                     break;
 
-                var cipher = _cipherGetter();
-                if (cipher == null)
-                    break;
-
-                var frame = Frame.EncodeTcpData(_connId, buffer.AsSpan(0, read), cipher);
-                try
-                {
-                    await _tunnel.SendAsync(frame, _proxyServer);
-                    Interlocked.Increment(ref _stats.PacketsOut);
-                    Interlocked.Increment(ref _stats.RepliesRelayed);
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [tcp] Ошибка отправки (connId {_connId}): {ex.Message}");
-                    break;
-                }
+                batcher.Append(buffer.AsSpan(0, read));
             }
+            batcher.Complete();
         }
 
         /// <summary>

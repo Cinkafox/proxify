@@ -440,6 +440,28 @@ try {
         if ($gotTcp -ne "PING-TCP") { throw "Игрок (TCP) получил неверный ответ" }
         Write-Host "    OK: TCP-путь через туннель работает."
 
+        # --- 5b. Большой HTTP-подобный поток (> MaxFramePayload=1400): батчер дробит кадры ---
+        $bigHeader = "HTTP/1.1 200 OK`r`nContent-Length: 3000`r`n`r`n"
+        $big = [Text.Encoding]::UTF8.GetBytes(($bigHeader + ("x" * 3000)))
+        $tcpStream.Write($big, 0, $big.Length)
+        Write-Host "[TCP 7] Игрок (TCP) отправил поток $($big.Length) байт (HTTP-ответ + тело 3000 байт)..."
+
+        $received = New-Object System.Collections.Generic.List[byte]
+        $deadline = (Get-Date).AddSeconds(5)
+        while ($received.Count -lt $big.Length -and (Get-Date) -lt $deadline) {
+            $bigFrame = Receive-FromSocket -Socket $tunnel -TimeoutMs 1000 -What "TcpData (большой поток)"
+            $bigBody = Decode-EncryptedBody -Frame $bigFrame -Key $sessionKey -ExpectedType 6
+            $bigRecvConnId = Read-U32BE -Bytes $bigBody -Offset 0
+            if ($bigRecvConnId -ne $connId) { throw "TcpData большого потока с неверным connId" }
+            [byte[]]$bigPayload = New-Object byte[] ($bigBody.Length - 4)
+            [Array]::Copy($bigBody, 4, $bigPayload, 0, $bigPayload.Length)
+            $received.AddRange($bigPayload)
+        }
+        if ($received.Count -ne $big.Length) { throw "Большой поток получен не полностью: $($received.Count)/$($big.Length)" }
+        $receivedBigText = [Text.Encoding]::UTF8.GetString($received.ToArray())
+        if ($receivedBigText -ne ([Text.Encoding]::UTF8.GetString($big))) { throw "Содержимое большого потока повреждено" }
+        Write-Host "    OK: большой поток ($($big.Length) байт) доставлен целым, батчер корректно дробит кадры."
+
         $tcpClient.Close()
         $tcpClient = $null
         $closeFrame = Receive-FromSocket -Socket $tunnel -TimeoutMs 3000 -What "TcpClose"
