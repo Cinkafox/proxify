@@ -28,8 +28,11 @@ public sealed class ClientSession : IDisposable
     /// <summary>TCP-соединения реальных клиентов: connId -> сокет.</summary>
     public ConcurrentDictionary<uint, TcpClient> TcpClients { get; } = new();
 
-    /// <summary>Сериализация записи в конкретное TCP-соединение (connId -> семафор).</summary>
-    public ConcurrentDictionary<uint, SemaphoreSlim> TcpWriteLocks { get; } = new();
+    /// <summary>Надёжная отправка TCP-данных прокси-клиенту (connId -> отправитель).</summary>
+    public ConcurrentDictionary<uint, TcpReliableSender> TcpSenders { get; } = new();
+
+    /// <summary>Надёжный приём TCP-данных от прокси-клиента (connId -> приёмник).</summary>
+    public ConcurrentDictionary<uint, TcpReliableReceiver> TcpReceivers { get; } = new();
 
     /// <summary>Игроки, уже контактировавшие с сервером (для однократного [диагностика]).</summary>
     public ConcurrentDictionary<IPEndPoint, byte> SeenClients { get; } = new();
@@ -69,9 +72,12 @@ public sealed class ClientSession : IDisposable
         TcpListener?.Stop();
         foreach (var client in TcpClients.Values)
             client.Close();
-        foreach (var writeLock in TcpWriteLocks.Values)
-            writeLock.Dispose();
+        foreach (var sender in TcpSenders.Values)
+            sender.Dispose();
+        foreach (var receiver in TcpReceivers.Values)
+            receiver.Dispose();
         TcpClients.Clear();
-        TcpWriteLocks.Clear();
+        TcpSenders.Clear();
+        TcpReceivers.Clear();
     }
 }

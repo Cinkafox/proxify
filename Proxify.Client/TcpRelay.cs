@@ -70,7 +70,7 @@ public sealed class TcpRelay : IDisposable
     }
 
     /// <summary>
-    /// Обрабатывает TCP-кадр (TcpOpen/TcpData/TcpClose), полученный из туннеля.
+    /// Обрабатывает TCP-кадр (TcpOpen/TcpData/TcpClose/TcpAck), полученный из туннеля.
     /// </summary>
     public void OnFrame(byte[] buffer, int length)
     {
@@ -91,6 +91,9 @@ public sealed class TcpRelay : IDisposable
                 break;
             case Frame.TypeTcpClose:
                 HandleClose(buffer, length);
+                break;
+            case Frame.TypeTcpAck:
+                HandleAck(buffer, length);
                 break;
         }
     }
@@ -120,7 +123,7 @@ public sealed class TcpRelay : IDisposable
     private void HandleData(byte[] buffer, int length)
     {
         var cipher = _cipherGetter();
-        if (cipher == null || !Frame.TryDecodeTcpData(buffer, length, cipher, out var connId, out var payload))
+        if (cipher == null || !Frame.TryDecodeTcpData(buffer, length, cipher, out var connId, out var seq, out var payload))
         {
             Interlocked.Increment(ref _stats.BadFrames);
             return;
@@ -129,12 +132,27 @@ public sealed class TcpRelay : IDisposable
         Interlocked.Increment(ref _stats.PacketsIn);
         if (_sessions.TryGetValue(connId, out var session))
         {
-            session.Forward(payload);
+            session.ReceiveFromTunnel(seq, payload);
         }
         else
         {
             Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] TcpData для неизвестного connId {connId}.");
         }
+    }
+
+    private void HandleAck(byte[] buffer, int length)
+    {
+        var cipher = _cipherGetter();
+        if (cipher == null || !Frame.TryDecodeTcpAck(buffer, length, cipher, out var connId, out var ackSeq))
+        {
+            Interlocked.Increment(ref _stats.BadFrames);
+            return;
+        }
+
+        if (_sessions.TryGetValue(connId, out var session))
+            session.OnAck(ackSeq);
+        else
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] TcpAck для неизвестного connId {connId}.");
     }
 
     private void HandleClose(byte[] buffer, int length)
@@ -169,6 +187,8 @@ public sealed class TcpRelay : IDisposable
         private readonly Func<TunnelCipher?> _cipherGetter;
         private readonly TunnelStats _stats;
         private readonly TcpRelay _relay;
+        private readonly TcpReliableSender _sender;
+        private readonly TcpReliableReceiver _receiver;
 
         // Данные, полученные из туннеля до/во время соединения с игровым сервером.
         private readonly Channel<byte[]> _toGame = Channel.CreateUnbounded<byte[]>();
@@ -194,6 +214,8 @@ public sealed class TcpRelay : IDisposable
             _cipherGetter = cipherGetter;
             _stats = stats;
             _relay = relay;
+            _sender = new TcpReliableSender(connId, SendTcpDataFrame);
+            _receiver = new TcpReliableReceiver(connId, payload => _toGame.Writer.TryWrite(payload), SendTcpAck);
         }
 
         public async Task RunAsync()
@@ -232,6 +254,9 @@ public sealed class TcpRelay : IDisposable
             }
             finally
             {
+                // Ждём подтверждения всех отправленных данных, чтобы последние байты
+                // ответа игрового сервера не потерялись из-за потери последнего кадра.
+                _sender.WaitDrained(TimeSpan.FromMilliseconds(500));
                 SendClose();
                 Close();
                 _relay.OnSessionClosed(_connId);
@@ -260,32 +285,10 @@ public sealed class TcpRelay : IDisposable
 
         private async Task ReaderLoopAsync(NetworkStream stream)
         {
-            var sendFailed = false;
-            using var batcher = new TcpFrameBatcher(data =>
-            {
-                var cipher = _cipherGetter();
-                if (cipher == null)
-                {
-                    sendFailed = true;
-                    return;
-                }
-
-                var frame = Frame.EncodeTcpData(_connId, data, cipher);
-                try
-                {
-                    _tunnel.Send(frame, _proxyServer);
-                    Interlocked.Increment(ref _stats.PacketsOut);
-                    Interlocked.Increment(ref _stats.RepliesRelayed);
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [tcp] Ошибка отправки (connId {_connId}): {ex.Message}");
-                    sendFailed = true;
-                }
-            });
+            using var batcher = new TcpFrameBatcher(_sender.Send);
 
             var buffer = new byte[16384];
-            while (!sendFailed)
+            while (true)
             {
                 int read;
                 try
@@ -310,9 +313,14 @@ public sealed class TcpRelay : IDisposable
         }
 
         /// <summary>
-        /// Данные из туннеля (от реального клиента) -> в очередь записи игровому серверу.
+        /// Данные из туннеля (от реального клиента) -> приёмник -> очередь записи игровому серверу.
         /// </summary>
-        public void Forward(byte[] data) => _toGame.Writer.TryWrite(data);
+        public void ReceiveFromTunnel(long seq, byte[] payload) => _receiver.Receive(payload, seq);
+
+        /// <summary>
+        /// Подтверждение приёма данных от прокси-сервера.
+        /// </summary>
+        public void OnAck(long ackSeq) => _sender.OnAck(ackSeq);
 
         /// <summary>
         /// Закрытие инициировано прокси-сервером (реальный клиент закрыл соединение).
@@ -321,6 +329,34 @@ public sealed class TcpRelay : IDisposable
         {
             SendClose();
             Close();
+        }
+
+        /// <summary>
+        /// Отправка кадра TcpData прокси-серверу (в том числе при повторной передаче —
+        /// каждый раз с актуальным сессионным ключом).
+        /// </summary>
+        private void SendTcpDataFrame(byte[] payload, uint connId, long seq)
+        {
+            var cipher = _cipherGetter();
+            if (cipher == null)
+                return;
+
+            var frame = Frame.EncodeTcpData(connId, seq, payload, cipher);
+            _tunnel.Send(frame, _proxyServer);
+            Interlocked.Increment(ref _stats.PacketsOut);
+            Interlocked.Increment(ref _stats.RepliesRelayed);
+        }
+
+        /// <summary>
+        /// Отправка кадра TcpAck прокси-серверу.
+        /// </summary>
+        private void SendTcpAck(uint connId, long ackSeq)
+        {
+            var cipher = _cipherGetter();
+            if (cipher == null)
+                return;
+
+            _tunnel.Send(Frame.EncodeTcpAck(connId, ackSeq, cipher), _proxyServer);
         }
 
         private void SendClose()
@@ -345,6 +381,8 @@ public sealed class TcpRelay : IDisposable
         private void Close()
         {
             _toGame.Writer.TryComplete();
+            _sender.Dispose();
+            _receiver.Dispose();
             _stream?.Dispose();
             _client?.Dispose();
             _stream = null;

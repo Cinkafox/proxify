@@ -14,11 +14,13 @@ namespace Proxify.Common;
 ///                0x03 = PING (диагностика связи при запуске прокси-клиента)
 ///                0x04 = PONG (ответ прокси-сервера на PING; тело = маркер + [1] флаг TCP)
 ///                0x05 = TCP: открытие соединения (сервер -> клиент)
-///                0x06 = TCP: данные соединения (в обе стороны)
+///                0x06 = TCP: данные соединения (в обе стороны, с порядковым номером)
 ///                0x07 = TCP: закрытие соединения (в обе стороны)
 ///                0x08 = AUTH (рукопожатие, без шифрования) — подпись ECDSA
 ///                0x09 = AUTH_ACK (рукопожатие, без шифрования) — эфемерный ключ
 ///                       сервера + зашифрованное «доказательство»
+///                0x0A = TCP: подтверждение приёма (в обе стороны; ackSeq =
+///                       следующий ожидаемый порядковый номер данных)
 ///                 для 0x03/0x04 тело = маркер (например, случайные байты),
 ///                 для PONG к маркеру добавляется байт признака TCP-проксирования;
 ///                 при заданном cipher тело шифруется как [12]nonce [16]tag [M]ciphertext
@@ -35,8 +37,9 @@ namespace Proxify.Common;
 /// Тело TCP-кадров (расшифрованный текст, все поля big endian):
 ///
 ///   TcpOpen (0x05): [4] IPv4 реального клиента [2] TCP-порт [4] connId
-///   TcpData (0x06): [4] connId [N] данные
+///   TcpData (0x06): [4] connId [4] порядковый номер (seq) [N] данные
 ///   TcpClose(0x07): [4] connId
+///   TcpAck  (0x0A): [4] connId [4] ackSeq (следующий ожидаемый порядковый номер)
 ///
 /// Кадр AUTH (0x08) передаётся БЕЗ шифрования (plaintext):
 ///
@@ -65,10 +68,12 @@ public static class Frame
     public const byte TypeTcpClose = 0x07;
     public const byte TypeAuth = 0x08;
     public const byte TypeAuthAck = 0x09;
+    public const byte TypeTcpAck = 0x0A;
 
     public const int HeaderLength = 3;
     public const int InnerHeaderLength = 11;
     public const int TcpHeaderLength = 4;
+    public const int TcpDataHeaderLength = 8;
 
     /// <summary>Длина тела кадра AUTH: версия + X + Y + nonce + подпись.</summary>
     public const int AuthBodyLength = 1 + 32 + 32 + 16 + 64;
@@ -284,13 +289,16 @@ public static class Frame
     }
 
     /// <summary>
-    /// Собирает TCP-кадр данных. Тело: [4] connId [N] данные.
+    /// Собирает TCP-кадр данных. Тело: [4] connId [4] seq [N] данные.
+    /// Порядковый номер позволяет принимающей стороне восстанавливать порядок
+    /// и обнаруживать потери (подтверждение кадром TcpAck).
     /// </summary>
-    public static byte[] EncodeTcpData(uint connId, ReadOnlySpan<byte> payload, TunnelCipher? cipher)
+    public static byte[] EncodeTcpData(uint connId, long seq, ReadOnlySpan<byte> payload, TunnelCipher? cipher)
     {
-        var body = new byte[TcpHeaderLength + payload.Length];
+        var body = new byte[TcpDataHeaderLength + payload.Length];
         var o = 0;
         WriteU32(body, ref o, connId);
+        WriteU32(body, ref o, unchecked((uint)seq));
         payload.CopyTo(body.AsSpan(o));
         return EncodeControl(TypeTcpData, body, cipher);
     }
@@ -298,18 +306,50 @@ public static class Frame
     /// <summary>
     /// Разбирает TCP-кадр данных.
     /// </summary>
-    public static bool TryDecodeTcpData(byte[] buffer, int length, TunnelCipher? cipher, out uint connId, out byte[] payload)
+    public static bool TryDecodeTcpData(byte[] buffer, int length, TunnelCipher? cipher, out uint connId, out long seq, out byte[] payload)
     {
         connId = 0;
+        seq = 0;
         payload = Array.Empty<byte>();
 
-        if (!TryDecodeControl(buffer, length, TypeTcpData, cipher, out var body) || body.Length < TcpHeaderLength)
+        if (!TryDecodeControl(buffer, length, TypeTcpData, cipher, out var body) || body.Length < TcpDataHeaderLength)
             return false;
 
         var o = 0;
         connId = ReadU32(body, ref o);
+        seq = ReadU32(body, ref o);
         payload = new byte[body.Length - o];
         Array.Copy(body, o, payload, 0, payload.Length);
+        return true;
+    }
+
+    /// <summary>
+    /// Собирает TCP-кадр подтверждения приёма. Тело: [4] connId [4] ackSeq,
+    /// где ackSeq — порядковый номер следующего ожидаемого кадра данных.
+    /// </summary>
+    public static byte[] EncodeTcpAck(uint connId, long ackSeq, TunnelCipher? cipher)
+    {
+        var body = new byte[TcpDataHeaderLength];
+        var o = 0;
+        WriteU32(body, ref o, connId);
+        WriteU32(body, ref o, unchecked((uint)ackSeq));
+        return EncodeControl(TypeTcpAck, body, cipher);
+    }
+
+    /// <summary>
+    /// Разбирает TCP-кадр подтверждения приёма.
+    /// </summary>
+    public static bool TryDecodeTcpAck(byte[] buffer, int length, TunnelCipher? cipher, out uint connId, out long ackSeq)
+    {
+        connId = 0;
+        ackSeq = 0;
+
+        if (!TryDecodeControl(buffer, length, TypeTcpAck, cipher, out var body) || body.Length != TcpDataHeaderLength)
+            return false;
+
+        var o = 0;
+        connId = ReadU32(body, ref o);
+        ackSeq = ReadU32(body, ref o);
         return true;
     }
 

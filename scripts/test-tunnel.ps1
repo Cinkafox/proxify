@@ -214,9 +214,40 @@ function Decode-EncryptedBody {
 }
 
 function Build-TcpDataFrame {
-    param([uint32]$ConnId, [byte[]]$Payload, [byte[]]$Key)
-    $body = Concat-Bytes @((Write-U32BE $ConnId), $Payload)
+    param([uint32]$ConnId, [uint32]$Seq, [byte[]]$Payload, [byte[]]$Key)
+    $body = Concat-Bytes @((Write-U32BE $ConnId), (Write-U32BE $Seq), $Payload)
     return Build-ControlFrame -Type 6 -Body $body -Key $Key
+}
+
+function Build-TcpAckFrame {
+    param([uint32]$ConnId, [uint32]$AckSeq, [byte[]]$Key)
+    $body = Concat-Bytes @((Write-U32BE $ConnId), (Write-U32BE $AckSeq))
+    return Build-ControlFrame -Type 10 -Body $body -Key $Key
+}
+
+function Send-TcpAck {
+    param([uint32]$ConnId, [uint32]$AckSeq, [byte[]]$Key)
+    $ack = Build-TcpAckFrame -ConnId $ConnId -AckSeq $AckSeq -Key $Key
+    [void]$tunnel.Send($ack, $ack.Length, "127.0.0.1", $TunnelPort)
+}
+
+function Read-TcpData {
+    param([uint32]$ConnId, [byte[]]$Key, [int]$TimeoutMs = 3000, [bool]$Ack = $true)
+    while ($true) {
+        $fr = Receive-FromSocket -Socket $tunnel -TimeoutMs $TimeoutMs -What "TcpData"
+        $frType = $fr[2]
+        if ($frType -eq 10) { continue }  # TcpAck — подтверждение наших кадров, игнорируем
+        if ($frType -ne 6) { throw "Ожидался TcpData (0x06), получен 0x$('{0:X2}' -f $frType)" }
+        $body = Decode-EncryptedBody -Frame $fr -Key $Key -ExpectedType 6
+        if ($body.Length -lt 8) { throw "Неверный формат TcpData (тело меньше 8 байт)" }
+        $recvConnId = Read-U32BE -Bytes $body -Offset 0
+        if ($recvConnId -ne $ConnId) { throw "TcpData с неверным connId $recvConnId (ожидался $ConnId)" }
+        $recvSeq = Read-U32BE -Bytes $body -Offset 4
+        $payload = New-Object byte[] ($body.Length - 8)
+        [Array]::Copy($body, 8, $payload, 0, $payload.Length)
+        if ($Ack) { Send-TcpAck -ConnId $ConnId -AckSeq ([uint32]($recvSeq + 1)) -Key $Key }
+        return ,[pscustomobject]@{ ConnId = $recvConnId; Seq = $recvSeq; Payload = $payload }
+    }
 }
 
 function Build-TcpCloseFrame {
@@ -418,20 +449,15 @@ try {
 
         $pingTcp = [Text.Encoding]::UTF8.GetBytes("PING-TCP")
         $tcpStream.Write($pingTcp, 0, $pingTcp.Length)
-        $dataFrame = Receive-FromSocket -Socket $tunnel -TimeoutMs 3000 -What "TcpData"
-        $dataBody = Decode-EncryptedBody -Frame $dataFrame -Key $sessionKey -ExpectedType 6
-        if ($dataBody.Length -lt 4) { throw "Неверный формат TcpData" }
-        $recvConnId = Read-U32BE -Bytes $dataBody -Offset 0
-        $recvPayload = New-Object byte[] ($dataBody.Length - 4)
-        [Array]::Copy($dataBody, 4, $recvPayload, 0, $recvPayload.Length)
-        $recvText = [Text.Encoding]::UTF8.GetString($recvPayload)
-        Write-Host "[TCP 3] Туннель получил от игрока: '$recvText' (connId=$recvConnId)"
-        if ($recvText -ne "PING-TCP" -or $recvConnId -ne $connId) { throw "TCP-данные переданы в туннель неверно" }
+        $data = Read-TcpData -ConnId $connId -Key $sessionKey
+        $recvText = [Text.Encoding]::UTF8.GetString($data.Payload)
+        Write-Host "[TCP 3] Туннель получил от игрока: '$recvText' (connId=$($data.ConnId), seq=$($data.Seq))"
+        if ($recvText -ne "PING-TCP") { throw "TCP-данные переданы в туннель неверно" }
 
         $echo = [Text.Encoding]::UTF8.GetBytes($recvText)
-        $echoFrame = Build-TcpDataFrame -ConnId $connId -Payload $echo -Key $sessionKey
+        $echoFrame = Build-TcpDataFrame -ConnId $connId -Seq 0 -Payload $echo -Key $sessionKey
         [void]$tunnel.Send($echoFrame, $echoFrame.Length, "127.0.0.1", $TunnelPort)
-        Write-Host "[TCP 4] Эмуляция игрового сервера ответила кадром TcpData."
+        Write-Host "[TCP 4] Эмуляция игрового сервера ответила кадром TcpData (seq=0)."
 
         $replyBuf = New-Object byte[] 1024
         $gotLen = $tcpStream.Read($replyBuf, 0, $replyBuf.Length)
@@ -440,23 +466,45 @@ try {
         if ($gotTcp -ne "PING-TCP") { throw "Игрок (TCP) получил неверный ответ" }
         Write-Host "    OK: TCP-путь через туннель работает."
 
+        # --- 5a. Проверка повторной передачи: не подтверждаем кадр и ждём его дубликат ---
+        $lost = [Text.Encoding]::UTF8.GetBytes("LOST-TEST")
+        $tcpStream.Write($lost, 0, $lost.Length)
+        $first = $null
+        $deadline = (Get-Date).AddSeconds(4)
+        while ($null -eq $first -and (Get-Date) -lt $deadline) {
+            $d = Read-TcpData -ConnId $connId -Key $sessionKey -Ack $false
+            if ([Text.Encoding]::UTF8.GetString($d.Payload) -eq "LOST-TEST") {
+                $first = $d   # не подтверждаем — сервер повторит этот кадр
+            }
+            else {
+                Send-TcpAck -ConnId $connId -AckSeq ([uint32]($d.Seq + 1)) -Key $sessionKey
+            }
+        }
+        if ($null -eq $first) { throw "Не получен кадр LOST-TEST" }
+        $second = Read-TcpData -ConnId $connId -Key $sessionKey -Ack $false
+        if ($second.Seq -ne $first.Seq) { throw "Повторная передача имеет другой seq: $($second.Seq) != $($first.Seq)" }
+        Send-TcpAck -ConnId $connId -AckSeq ([uint32]($second.Seq + 1)) -Key $sessionKey
+        Write-Host "[TCP 6] Повторная передача подтверждена: seq $($first.Seq) получен дважды, данные целы."
+        Write-Host "    OK: надёжность (seq + повторная передача) работает."
+
         # --- 5b. Большой HTTP-подобный поток (> MaxFramePayload=1400): батчер дробит кадры ---
         $bigHeader = "HTTP/1.1 200 OK`r`nContent-Length: 3000`r`n`r`n"
         $big = [Text.Encoding]::UTF8.GetBytes(($bigHeader + ("x" * 3000)))
         $tcpStream.Write($big, 0, $big.Length)
         Write-Host "[TCP 7] Игрок (TCP) отправил поток $($big.Length) байт (HTTP-ответ + тело 3000 байт)..."
 
-        $received = New-Object System.Collections.Generic.List[byte]
-        $deadline = (Get-Date).AddSeconds(5)
-        while ($received.Count -lt $big.Length -and (Get-Date) -lt $deadline) {
-            $bigFrame = Receive-FromSocket -Socket $tunnel -TimeoutMs 1000 -What "TcpData (большой поток)"
-            $bigBody = Decode-EncryptedBody -Frame $bigFrame -Key $sessionKey -ExpectedType 6
-            $bigRecvConnId = Read-U32BE -Bytes $bigBody -Offset 0
-            if ($bigRecvConnId -ne $connId) { throw "TcpData большого потока с неверным connId" }
-            [byte[]]$bigPayload = New-Object byte[] ($bigBody.Length - 4)
-            [Array]::Copy($bigBody, 4, $bigPayload, 0, $bigPayload.Length)
-            $received.AddRange($bigPayload)
+        $bySeq = @{}   # seq -> payload (дедупликация и восстановление порядка)
+        $total = 0
+        $deadline = (Get-Date).AddSeconds(6)
+        while ($total -lt $big.Length -and (Get-Date) -lt $deadline) {
+            $d = Read-TcpData -ConnId $connId -Key $sessionKey
+            if ($d.Seq -lt 2 -or $bySeq.ContainsKey($d.Seq)) { continue }  # повторы уже подтверждённых кадров
+            $bySeq[$d.Seq] = $d.Payload
+            $total += $d.Payload.Length
         }
+        if ($total -ne $big.Length) { throw "Большой поток получен не полностью: $total/$($big.Length)" }
+        $received = New-Object System.Collections.Generic.List[byte]
+        foreach ($k in ($bySeq.Keys | Sort-Object)) { $received.AddRange($bySeq[$k]) }
         if ($received.Count -ne $big.Length) { throw "Большой поток получен не полностью: $($received.Count)/$($big.Length)" }
         $receivedBigText = [Text.Encoding]::UTF8.GetString($received.ToArray())
         if ($receivedBigText -ne ([Text.Encoding]::UTF8.GetString($big))) { throw "Содержимое большого потока повреждено" }
@@ -464,11 +512,19 @@ try {
 
         $tcpClient.Close()
         $tcpClient = $null
-        $closeFrame = Receive-FromSocket -Socket $tunnel -TimeoutMs 3000 -What "TcpClose"
+        $closeFrame = $null
+        $deadline = (Get-Date).AddSeconds(4)
+        while ($null -eq $closeFrame -and (Get-Date) -lt $deadline) {
+            $fr = Receive-FromSocket -Socket $tunnel -TimeoutMs 1000 -What "TcpClose"
+            if ($fr[2] -eq 10) { continue }  # TcpAck — игнорируем
+            if ($fr[2] -ne 7) { throw "Ожидался TcpClose, получен 0x$('{0:X2}' -f $fr[2])" }
+            $closeFrame = $fr
+        }
+        if ($null -eq $closeFrame) { throw "Не получен TcpClose в течение 4 секунд" }
         $closeBody = Decode-EncryptedBody -Frame $closeFrame -Key $sessionKey -ExpectedType 7
         $closeConnId = Read-U32BE -Bytes $closeBody -Offset 0
         if ($closeConnId -ne $connId) { throw "TcpClose с неверным connId" }
-        Write-Host "[TCP 6] Сервер уведомил о закрытии соединения (connId=$connId)."
+        Write-Host "[TCP 8] Сервер уведомил о закрытии соединения (connId=$connId)."
     }
 
     Write-Host ""

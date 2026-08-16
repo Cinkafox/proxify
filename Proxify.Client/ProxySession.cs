@@ -288,6 +288,7 @@ public sealed class ProxySession : IDisposable
         Cipher = cipher;
         Config = config;
         Interlocked.Exchange(ref _lastPongTicks, DateTime.UtcNow.Ticks);
+        ServerTcp.Set(config.TcpEnabled);
 
         lock (_authLock)
         {
@@ -327,7 +328,7 @@ public sealed class ProxySession : IDisposable
             }
 
             var frameType = Frame.PeekFrameType(result.Buffer, result.Buffer.Length);
-            if (frameType is Frame.TypeTcpOpen or Frame.TypeTcpData or Frame.TypeTcpClose)
+            if (frameType is Frame.TypeTcpOpen or Frame.TypeTcpData or Frame.TypeTcpClose or Frame.TypeTcpAck)
             {
                 _tcpRelay?.OnFrame(result.Buffer, result.Buffer.Length);
                 continue;

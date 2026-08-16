@@ -109,15 +109,46 @@ public sealed class ProxySession : IDisposable
 
         if (frameType == Frame.TypeTcpData)
         {
-            if (Frame.TryDecodeTcpData(data, data.Length, cipher, out var connId, out var payload))
+            if (Frame.TryDecodeTcpData(data, data.Length, cipher, out var connId, out var seq, out var payload))
             {
                 _client.TouchActivity();
-                await HandleTcpDataAsync(connId, payload);
+                if (_client.TcpReceivers.TryGetValue(connId, out var receiver))
+                {
+                    receiver.Receive(payload, seq);
+                }
+                else
+                {
+                    Interlocked.Increment(ref _stats.BadFrames);
+                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] TcpData для неизвестного connId {connId}.");
+                }
             }
             else
             {
                 Interlocked.Increment(ref _stats.BadFrames);
                 Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Не удалось разобрать TcpData от {from}.");
+            }
+            return;
+        }
+
+        if (frameType == Frame.TypeTcpAck)
+        {
+            if (Frame.TryDecodeTcpAck(data, data.Length, cipher, out var connId, out var ackSeq))
+            {
+                _client.TouchActivity();
+                if (_client.TcpSenders.TryGetValue(connId, out var sender))
+                {
+                    sender.OnAck(ackSeq);
+                }
+                else
+                {
+                    Interlocked.Increment(ref _stats.BadFrames);
+                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] TcpAck для неизвестного connId {connId}.");
+                }
+            }
+            else
+            {
+                Interlocked.Increment(ref _stats.BadFrames);
+                Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Не удалось разобрать TcpAck от {from}.");
             }
             return;
         }
@@ -284,33 +315,27 @@ public sealed class ProxySession : IDisposable
             tcpClient.NoDelay = true;
             _client.TcpClients[connId] = tcpClient;
 
+            var sender = new TcpReliableSender(connId, SendTcpDataFrame);
+            var receiver = new TcpReliableReceiver(connId, payload => WriteToBrowser(connId, payload), SendTcpAck);
+            _client.TcpSenders[connId] = sender;
+            _client.TcpReceivers[connId] = receiver;
+
             var remote = (IPEndPoint)tcpClient.Client.RemoteEndPoint!;
             Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [диагностика] Клиент '{_client.DisplayName}': новый TCP-клиент {remote} (connId {connId}).");
 
             var open = Frame.EncodeTcpOpen(remote.Address, (ushort)remote.Port, connId, cipher);
             await _tunnel.SendAsync(open, proxy);
 
-            _ = Task.Run(() => HandleTcpClientAsync(tcpClient, connId));
+            _ = Task.Run(() => HandleTcpClientAsync(tcpClient, connId, sender));
         }
     }
 
-    private async Task HandleTcpClientAsync(TcpClient tcpClient, uint connId)
+    private async Task HandleTcpClientAsync(TcpClient tcpClient, uint connId, TcpReliableSender sender)
     {
         try
         {
             var stream = tcpClient.GetStream();
-            using var batcher = new TcpFrameBatcher(data =>
-            {
-                var proxy = _client.TunnelEndpoint;
-                var cipher = _client.Cipher;
-                if (proxy == null || cipher == null)
-                    return;
-
-                Interlocked.Increment(ref _stats.PacketsIn);
-                Interlocked.Increment(ref _stats.PacketsOut);
-                var frame = Frame.EncodeTcpData(connId, data, cipher);
-                _tunnel.Send(frame, proxy);
-            });
+            using var batcher = new TcpFrameBatcher(sender.Send);
 
             var buffer = new byte[16384];
             while (true)
@@ -342,6 +367,9 @@ public sealed class ProxySession : IDisposable
         }
         finally
         {
+            // Ждём подтверждения всех отправленных данных, чтобы последние байты
+            // ответа не потерялись из-за потери последнего кадра.
+            sender.WaitDrained(TimeSpan.FromMilliseconds(500));
             await CloseTcpWithRemoteAsync(connId);
         }
     }
@@ -360,8 +388,11 @@ public sealed class ProxySession : IDisposable
             }
         }
 
-        if (_client.TcpWriteLocks.TryRemove(connId, out var writeLock))
-            writeLock.Dispose();
+        if (_client.TcpSenders.TryRemove(connId, out var sender))
+            sender.Dispose();
+
+        if (_client.TcpReceivers.TryRemove(connId, out var receiver))
+            receiver.Dispose();
     }
 
     private async Task CloseTcpWithRemoteAsync(uint connId)
@@ -384,37 +415,50 @@ public sealed class ProxySession : IDisposable
         }
     }
 
-    private async Task HandleTcpDataAsync(uint connId, byte[] payload)
+    private uint NextTcpConnId() => (uint)Interlocked.Increment(ref _nextTcpConnId);
+
+    /// <summary>
+    /// Отправка кадра TcpData прокси-клиенту (вызывается отправителем, в том числе
+    /// при повторной передаче — каждый раз с актуальным сессионным ключом).
+    /// </summary>
+    private void SendTcpDataFrame(byte[] payload, uint connId, long seq)
     {
-        if (_client.TcpClients.TryGetValue(connId, out var tcpClient))
-        {
-            var writeLock = _client.TcpWriteLocks.GetOrAdd(connId, _ => new SemaphoreSlim(1, 1));
-            try
-            {
-                await writeLock.WaitAsync();
-                try
-                {
-                    await tcpClient.GetStream().WriteAsync(payload);
-                    Interlocked.Increment(ref _stats.RepliesRelayed);
-                }
-                finally
-                {
-                    writeLock.Release();
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [ошибка] Запись TCP-клиенту (connId {connId}): {ex.Message}");
-                CloseTcpLocally(connId);
-            }
-        }
-        else
-        {
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] TcpData для неизвестного connId {connId}.");
-        }
+        var proxy = _client.TunnelEndpoint;
+        var cipher = _client.Cipher;
+        if (proxy == null || cipher == null)
+            return;
+
+        Interlocked.Increment(ref _stats.PacketsOut);
+        _tunnel.Send(Frame.EncodeTcpData(connId, seq, payload, cipher), proxy);
     }
 
-    private uint NextTcpConnId() => (uint)Interlocked.Increment(ref _nextTcpConnId);
+    /// <summary>
+    /// Отправка кадра TcpAck прокси-клиенту.
+    /// </summary>
+    private void SendTcpAck(uint connId, long ackSeq)
+    {
+        var proxy = _client.TunnelEndpoint;
+        var cipher = _client.Cipher;
+        if (proxy == null || cipher == null)
+            return;
+
+        _tunnel.Send(Frame.EncodeTcpAck(connId, ackSeq, cipher), proxy);
+    }
+
+    /// <summary>
+    /// Запись упорядоченных данных реальному TCP-клиенту (доставка от приёмника).
+    /// </summary>
+    private void WriteToBrowser(uint connId, byte[] payload)
+    {
+        if (!_client.TcpClients.TryGetValue(connId, out var tcpClient))
+        {
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] TcpData для неизвестного connId {connId}.");
+            return;
+        }
+
+        tcpClient.GetStream().Write(payload, 0, payload.Length);
+        Interlocked.Increment(ref _stats.RepliesRelayed);
+    }
 
     public void Dispose() => _client.Dispose();
 }

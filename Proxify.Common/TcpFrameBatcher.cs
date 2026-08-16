@@ -36,7 +36,7 @@ public sealed class TcpFrameBatcher : IDisposable
     public const int HeaderEndScanLimit = 8192;
 
     /// <summary>Nagle-подобная задержка перед отправкой мелкого фрагмента (по умолчанию).</summary>
-    public static readonly TimeSpan DefaultNagleDelay = TimeSpan.FromMilliseconds(5);
+    public static readonly TimeSpan DefaultNagleDelay = TimeSpan.FromMilliseconds(2);
 
     private readonly object _sync = new();
     private readonly Action<byte[]> _sendFrame;
