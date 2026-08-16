@@ -26,6 +26,7 @@ public sealed class LoopbackAliasManager : IDisposable
 
     private readonly object _lock = new();
     private readonly ConcurrentDictionary<IPAddress, uint> _aliases = new();
+    private readonly HashSet<IPAddress> _preexisting = new();
     private readonly bool _enabled;
     private readonly bool _isWindows = OperatingSystem.IsWindows();
 
@@ -47,7 +48,7 @@ public sealed class LoopbackAliasManager : IDisposable
 
         lock (_lock)
         {
-            if (_disposed || _aliases.ContainsKey(ip))
+            if (_disposed || _aliases.ContainsKey(ip) || _preexisting.Contains(ip))
                 return;
 
             if (_isWindows)
@@ -67,6 +68,9 @@ public sealed class LoopbackAliasManager : IDisposable
 
         lock (_lock)
         {
+            if (_preexisting.Remove(ip))
+                return;
+
             if (!_aliases.TryRemove(ip, out var context))
                 return;
 
@@ -101,6 +105,7 @@ public sealed class LoopbackAliasManager : IDisposable
         }
         else if (error == ErrorObjectAlreadyExists)
         {
+            _preexisting.Add(ip);
             Console.WriteLine($"[alias] Loopback-алиас {ip}/32 уже существует (не удаляется при остановке)");
         }
         else if (error != ErrorNotSupported)
@@ -123,6 +128,7 @@ public sealed class LoopbackAliasManager : IDisposable
             // Адрес уже присутствует на lo: из предыдущего запуска или был назначен
             // вручную. Это штатная ситуация — ответы игрового сервера всё равно
             // маршрутизируются в loopback, алиас не будет удалён при остановке.
+            _preexisting.Add(ip);
             Console.WriteLine($"[alias] Loopback-алиас {ip}/32 уже существует (не удаляется при остановке)");
         }
         else
@@ -207,6 +213,7 @@ public sealed class LoopbackAliasManager : IDisposable
             }
 
             _aliases.Clear();
+            _preexisting.Clear();
         }
     }
 

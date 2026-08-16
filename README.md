@@ -234,6 +234,12 @@ dotnet run --project Proxify.SelfTest -c Release
 | `docker-compose.local.yml` | Обе машины (A и B) на одной машине — быстрая проверка. |
 | `docker-compose.machine-a.yml` | Только прокси-сервер (машина A). |
 | `docker-compose.machine-b.yml` | Прокси-клиент + игровой сервер (машина B). |
+| `docker-compose.machine-b.host.yml` | Прокси-клиент в host-режиме, игровой сервер на хосте машины B. |
+
+Если игровой сервер запущен на хосте машины B (а не в контейнере), прокси-клиент
+должен работать в host-режиме (`network_mode: host`), иначе Docker NAT перепишет
+подменённый IP игрока (сервер увидит шлюз docker-сети вместо настоящего IP), а
+ответы игры не попадут в сниффер. См. `docker-compose.machine-b.host.yml`.
 
 Образ `client` собирается с игровым UDP-сервером-эхом
 (`docker/gamesrv.py`, порт `7777`) — замените его своим сервером, но
