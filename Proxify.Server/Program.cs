@@ -155,7 +155,6 @@ async Task TcpLoop()
 
         var remote = (IPEndPoint)client.Client.RemoteEndPoint!;
         Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [диагностика] Новый TCP-клиент {remote} (connId {connId}).");
-        Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [tcp] Открытие соединения {remote.Address}:{remote.Port} -> прокси-клиенту (connId {connId}).");
 
         var open = Frame.EncodeTcpOpen(remote.Address, (ushort)remote.Port, connId, cipher);
         await tunnel.SendAsync(open, proxy!);
@@ -195,8 +194,6 @@ async Task HandleTcpClientAsync(TcpClient client, uint connId)
 
             Interlocked.Increment(ref stats.PacketsIn);
             Interlocked.Increment(ref stats.PacketsOut);
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [tcp клиент ->] connId {connId} ({read} байт)");
-
             var frame = Frame.EncodeTcpData(connId, buffer.AsSpan(0, read), cipher);
             await tunnel.SendAsync(frame, proxy);
         }
@@ -338,7 +335,6 @@ async Task HandlePlayerPacket(IPEndPoint from, byte[] data)
             Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [диагностика] Новый игрок подключился: {from}.");
         Interlocked.Increment(ref stats.PacketsIn);
         Interlocked.Increment(ref stats.PacketsOut);
-        Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [клиент ->] {from} ({data.Length} байт)");
         var frame = Frame.EncodeData(from.Address, (ushort)from.Port, data, cipher);
         await tunnel.SendAsync(frame, proxyClientEndpoint);
     }
@@ -386,7 +382,6 @@ async Task HandleTunnelFrame(IPEndPoint from, byte[] data)
                     {
                         await tcpClient.GetStream().WriteAsync(payload);
                         Interlocked.Increment(ref stats.RepliesRelayed);
-                        Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [tcp ответ ->] connId {connId} ({payload.Length} байт)");
                     }
                     catch (Exception ex)
                     {
@@ -446,7 +441,6 @@ async Task HandleTunnelFrame(IPEndPoint from, byte[] data)
                 var target = new IPEndPoint(clientIp, clientPort);
                 Interlocked.Increment(ref stats.PacketsIn);
                 Interlocked.Increment(ref stats.RepliesRelayed);
-                Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [ответ ->] {target} ({payload.Length} байт)");
                 await udp.SendAsync(payload, target);
             }
             else

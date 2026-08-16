@@ -93,14 +93,13 @@ public sealed class TcpRelay : IDisposable
 
     private void HandleOpen(byte[] buffer, int length)
     {
-        if (!Frame.TryDecodeTcpOpen(buffer, length, _cipher, out var clientIp, out var clientPort, out var connId))
+        if (!Frame.TryDecodeTcpOpen(buffer, length, _cipher, out _, out _, out var connId))
         {
             Interlocked.Increment(ref _stats.BadFrames);
             Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Не удалось разобрать TcpOpen.");
             return;
         }
 
-        Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [tcp] Открытие соединения от {clientIp}:{clientPort} (connId {connId}).");
         var session = new TcpSession(connId, _gameIp, _gamePort, _tunnel, _proxyServer, _cipher, _stats, this);
         if (_sessions.TryAdd(connId, session))
         {
@@ -279,7 +278,6 @@ public sealed class TcpRelay : IDisposable
                     await _tunnel.SendAsync(frame, _proxyServer);
                     Interlocked.Increment(ref _stats.PacketsOut);
                     Interlocked.Increment(ref _stats.RepliesRelayed);
-                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [tcp ответ ->] connId {_connId} ({read} байт)");
                 }
                 catch (Exception ex)
                 {

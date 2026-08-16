@@ -88,7 +88,6 @@ public sealed class ReplySniffer : IDisposable
             if (!_knownClients.ContainsKey(client))
                 continue;
 
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [сервер ->] {client} ({payload.Length} байт)");
             Interlocked.Increment(ref _stats.RepliesCaptured);
             var frame = Frame.EncodeData(dstIp, dstPort, payload, _cipher);
 

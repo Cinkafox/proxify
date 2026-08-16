@@ -373,8 +373,6 @@ static async Task ReceiveLoop(
         if (reportFirstFrame())
             Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [диагностика] Получен первый кадр туннеля от прокси-сервера — канал работает.");
 
-        Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [клиент ->] {clientIp}:{clientPort} ({payload.Length} байт)");
-
         aliases.Add(clientIp);
         knownClients[new IPEndPoint(clientIp, clientPort)] = DateTime.UtcNow;
         activeIps[clientIp] = DateTime.UtcNow;
