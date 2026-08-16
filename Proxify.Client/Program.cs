@@ -8,7 +8,7 @@ using Proxify.Common;
 
 Console.OutputEncoding = Encoding.UTF8;
 
-var cli = new ArgParser("Proxy.Client")
+var cli = new ArgParser("Proxify.Client")
     .Add("server", "IP или имя хоста прокси-сервера (машина A). Трафик туннеля уходит на его --tunnel-port", required: true, shortName: 's')
     .Add("tunnel-port", "UDP-порт туннеля ПРОКСИ-СЕРВЕРА (машины A); должен совпадать с --tunnel-port сервера", required: true, shortName: 't')
     .Add("game-ip", "IP игрового сервера, обычно 127.0.0.1", shortName: 'g', defaultValue: "127.0.0.1")
@@ -101,10 +101,6 @@ Console.WriteLine($"Перехват ответов       : {(captureReplies ? "
 Console.WriteLine($"Loopback-алиасы        : {(loopbackAliases ? "вкл" : "выкл")}");
 Console.WriteLine("Шифрование туннеля      : вкл (AES-256-GCM)");
 Console.WriteLine();
-Console.WriteLine("Локальный порт туннеля выбирается автоматически (эфемерный) — на машине B");
-Console.WriteLine("открывать порты не нужно: клиент сам устанавливает исходящее соединение");
-Console.WriteLine("на порт туннеля прокси-сервера.");
-Console.WriteLine();
 
 try
 {
@@ -123,7 +119,7 @@ catch (SocketException ex) when (ex.SocketErrorCode == SocketError.AccessDenied)
     else
     {
         Console.WriteLine("[!] Создание RawSocket требует прав root или CAP_NET_RAW.");
-        Console.WriteLine("[!] Запустите: sudo Proxy.Client ...");
+        Console.WriteLine("[!] Запустите: sudo Proxify.Client ...");
     }
 }
 catch (Exception ex)

@@ -1,6 +1,6 @@
 <Solution>
-  <Project Path="Proxy.Client/Proxy.Client.csproj" />
-  <Project Path="Proxy.Common/Proxy.Common.csproj" />
-  <Project Path="Proxy.SelfTest/Proxy.SelfTest.csproj" />
-  <Project Path="Proxy.Server/Proxy.Server.csproj" />
+  <Project Path="Proxify.Client/Proxify.Client.csproj" />
+  <Project Path="Proxify.Common/Proxify.Common.csproj" />
+  <Project Path="Proxify.SelfTest/Proxify.SelfTest.csproj" />
+  <Project Path="Proxify.Server/Proxify.Server.csproj" />
 </Solution>

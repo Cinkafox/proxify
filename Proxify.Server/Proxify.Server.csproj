@@ -1,7 +1,7 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <ItemGroup>
-    <ProjectReference Include="..\Proxy.Common\Proxy.Common.csproj" />
+    <ProjectReference Include="..\Proxify.Common\Proxify.Common.csproj" />
   </ItemGroup>
 
   <PropertyGroup>
@@ -9,6 +9,7 @@
     <TargetFramework>net8.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <RootNamespace>Proxy.Server</RootNamespace>
   </PropertyGroup>
 
 </Project>

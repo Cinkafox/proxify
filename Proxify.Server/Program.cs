@@ -6,7 +6,7 @@ using Proxify.Common;
 
 Console.OutputEncoding = Encoding.UTF8;
 
-var cli = new ArgParser("Proxy.Server")
+var cli = new ArgParser("Proxify.Server")
     .Add("port", "UDP-порт, на который подключаются клиенты игры", required: true, shortName: 'p')
     .Add("tunnel-port", "UDP-порт туннеля, на который прокси-клиент (машина B) шлёт кадры", required: true, shortName: 't')
     .Add("key", "Ключ шифрования (одинаковый у сервера и клиента). Обязателен — кадры всегда шифруются AES-256-GCM", required: true, shortName: 'k');
