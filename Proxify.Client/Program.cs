@@ -105,8 +105,10 @@ Console.WriteLine();
 try
 {
     using var tunnel = new UdpClient();
-    await HandshakeAsync(proxyServer, tunnel, cipher);
-    await RunAsync(proxyServer, gameIp, (ushort)gamePort, tunnel, captureReplies, loopbackAliases, cipher);
+    var serverTcp = new ServerTcpStatus();
+    var (handshakeOk, serverTcpEnabled) = await HandshakeAsync(proxyServer, tunnel, cipher);
+    serverTcp.Set(serverTcpEnabled);
+    await RunAsync(proxyServer, gameIp, (ushort)gamePort, tunnel, captureReplies, loopbackAliases, serverTcp, cipher);
 }
 catch (SocketException ex) when (ex.SocketErrorCode == SocketError.AccessDenied)
 {
@@ -134,7 +136,8 @@ return 0;
 /// PING уходит с туннельного сокета — сервер по нему определяет адрес туннеля.
 /// Работает даже при несовпадении ключа — сервер ответит «не разобранным» PING,
 /// и клиент это увидит в логе сервера. При неудаче клиент всё равно продолжает работу.
-static async Task<bool> HandshakeAsync(IPEndPoint proxyServer, UdpClient socket, TunnelCipher? cipher)
+/// Возвращает результат связи и флаг TCP-проксирования, который сервер передаёт в PONG.
+static async Task<(bool Ok, bool TcpEnabled)> HandshakeAsync(IPEndPoint proxyServer, UdpClient socket, TunnelCipher? cipher)
 {
     Console.WriteLine("[диагностика] Проверка связи с прокси-сервером (PING/PONG)...");
 
@@ -177,12 +180,13 @@ static async Task<bool> HandshakeAsync(IPEndPoint proxyServer, UdpClient socket,
                 break;
             }
 
-            if (Frame.TryDecodeControl(resp, resp.Length, Frame.TypePong, cipher, out var pongToken)
+            if (Frame.TryDecodePong(resp, resp.Length, cipher, token.Length, out var pongToken, out var tcpFlag)
                 && pongToken.AsSpan().SequenceEqual(token))
             {
                 sw.Stop();
                 Console.WriteLine($"[диагностика] OK: сервер {proxyServer} ответил на PING за {sw.ElapsedMilliseconds} мс.");
-                return true;
+                Console.WriteLine($"[диагностика] TCP-проксирование на сервере: {(tcpFlag ? "включено" : "выключено")}.");
+                return (true, tcpFlag);
             }
 
             Console.WriteLine("[диагностика] Получен несоответствующий PONG — жду дальше.");
@@ -197,7 +201,7 @@ static async Task<bool> HandshakeAsync(IPEndPoint proxyServer, UdpClient socket,
     Console.WriteLine("[!]   2) файрвол машины A пропускает UDP-трафик на порт туннеля;");
     Console.WriteLine("[!]   3) ключ шифрования совпадает у сервера и клиента.");
     Console.WriteLine("[!] Прокси-клиент продолжит работу и выведет [диагностика], как только получит первый кадр.");
-    return false;
+    return (false, false);
 }
 
 static async Task RunAsync(
@@ -207,6 +211,7 @@ static async Task RunAsync(
     UdpClient tunnel,
     bool captureReplies,
     bool loopbackAliases,
+    ServerTcpStatus serverTcp,
     TunnelCipher? cipher)
 {
     using var cts = new CancellationTokenSource();
@@ -223,13 +228,14 @@ static async Task RunAsync(
 
     var aliases = new LoopbackAliasManager(loopbackAliases);
     using var injector = new RawInjector(gameIp, gamePort);
+    using var tcpRelay = new TcpRelay(gameIp, gamePort, tunnel, proxyServer, cipher, stats, serverTcp);
     using var statsTimer = new Timer(_ => stats.Print("прокси-клиент"), null, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(1));
 
     ReplySniffer? sniffer = null;
     var tasks = new List<Task>
     {
         Task.Run(() => ReceiveLoop(tunnel, aliases, injector, knownClients, activeIps, cipher, stats,
-            () => Interlocked.Exchange(ref firstServerFrame, 1) == 0, cts.Token)),
+            () => Interlocked.Exchange(ref firstServerFrame, 1) == 0, cts.Token, tcpRelay, serverTcp)),
         Task.Run(() => HeartbeatLoop(tunnel, proxyServer, cipher, cts.Token))
     };
 
@@ -304,7 +310,9 @@ static async Task ReceiveLoop(
     TunnelCipher? cipher,
     TunnelStats stats,
     Func<bool> reportFirstFrame,
-    CancellationToken ct)
+    CancellationToken ct,
+    TcpRelay tcpRelay,
+    ServerTcpStatus serverTcp)
 {
     while (!ct.IsCancellationRequested)
     {
@@ -328,15 +336,29 @@ static async Task ReceiveLoop(
         }
 
         var frameType = Frame.PeekFrameType(result.Buffer, result.Buffer.Length);
+        if (frameType is Frame.TypeTcpOpen or Frame.TypeTcpData or Frame.TypeTcpClose)
+        {
+            tcpRelay.OnFrame(result.Buffer, result.Buffer.Length);
+            continue;
+        }
+
+        if (frameType == Frame.TypePong)
+        {
+            // Сервер каждым PONG сообщает, включено ли у него TCP-проксирование.
+            if (Frame.TryDecodePong(result.Buffer, result.Buffer.Length, cipher, 16, out _, out var tcpFlag))
+                serverTcp.Set(tcpFlag);
+            continue;
+        }
+        if (frameType == Frame.TypePing)
+        {
+            // служебные кадры (в т.ч. ответы на сердцебиение) — не трафик
+            continue;
+        }
+
         if (frameType == Frame.TypeData && cipher != null)
         {
             Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Получен незашифрованный кадр, но шифрование включено. Проверьте ключ у прокси-сервера.");
             Interlocked.Increment(ref stats.BadFrames);
-            continue;
-        }
-        if (frameType is Frame.TypePing or Frame.TypePong)
-        {
-            // служебные кадры (в т.ч. ответы на сердцебиение) — не трафик
             continue;
         }
 

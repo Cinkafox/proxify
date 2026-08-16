@@ -12,8 +12,12 @@ namespace Proxify.Common;
 ///                0x01 = данные без шифрования  -> далее внутренний кадр данных
 ///                0x02 = данные с шифрованием   -> далее [12]nonce [16]tag [N]ciphertext
 ///                0x03 = PING (диагностика связи при запуске прокси-клиента)
-///                0x04 = PONG (ответ прокси-сервера на PING)
-///                 для 0x03/0x04 тело = маркер (например, случайные байты);
+///                0x04 = PONG (ответ прокси-сервера на PING; тело = маркер + [1] флаг TCP)
+///                0x05 = TCP: открытие соединения (сервер -> клиент)
+///                0x06 = TCP: данные соединения (в обе стороны)
+///                0x07 = TCP: закрытие соединения (в обе стороны)
+///                 для 0x03/0x04 тело = маркер (например, случайные байты),
+///                 для PONG к маркеру добавляется байт признака TCP-проксирования;
 ///                 при заданном cipher тело шифруется как [12]nonce [16]tag [M]ciphertext
 ///
 /// Внутренний кадр данных (расшифрованный текст для типа 0x02):
@@ -24,6 +28,12 @@ namespace Proxify.Common;
 ///   [2 байта]  UDP-порт реального клиента (big endian)
 ///   [2 байта]  длина полезной нагрузки (big endian)
 ///   [N байт ]  полезная нагрузка (исходная UDP-датаграмма)
+///
+/// Тело TCP-кадров (расшифрованный текст, все поля big endian):
+///
+///   TcpOpen (0x05): [4] IPv4 реального клиента [2] TCP-порт [4] connId
+///   TcpData (0x06): [4] connId [N] данные
+///   TcpClose(0x07): [4] connId
 /// </summary>
 public static class Frame
 {
@@ -32,9 +42,13 @@ public static class Frame
     public const byte TypeDataEncrypted = 0x02;
     public const byte TypePing = 0x03;
     public const byte TypePong = 0x04;
+    public const byte TypeTcpOpen = 0x05;
+    public const byte TypeTcpData = 0x06;
+    public const byte TypeTcpClose = 0x07;
 
     public const int HeaderLength = 3;
     public const int InnerHeaderLength = 11;
+    public const int TcpHeaderLength = 4;
 
     /// <summary>
     /// Собирает туннельный кадр. Если передан cipher — кадр шифруется (тип 0x02),
@@ -158,6 +172,150 @@ public static class Frame
         return cipher.TryUnwrap(body, out payload);
     }
 
+    /// <summary>
+    /// Собирает PONG с состоянием TCP-проксирования на сервере.
+    /// Тело: [M] токен из PING + [1] байт флага (1 = TCP-проксирование включено).
+    /// </summary>
+    public static byte[] EncodePong(byte[] token, bool tcpEnabled, TunnelCipher? cipher)
+    {
+        var body = new byte[token.Length + 1];
+        token.CopyTo(body, 0);
+        body[^1] = tcpEnabled ? (byte)1 : (byte)0;
+        return EncodeControl(TypePong, body, cipher);
+    }
+
+    /// <summary>
+    /// Разбирает PONG. Возвращает токен (должен совпадать с токеном PING) и флаг
+    /// TCP-проксирования. Поддерживается и старый формат PONG без флага
+    /// (тело = только токен) — тогда флаг считается выключенным.
+    /// </summary>
+    public static bool TryDecodePong(
+        byte[] buffer, int length, TunnelCipher? cipher, int expectedTokenLength,
+        out byte[] token, out bool tcpEnabled)
+    {
+        token = Array.Empty<byte>();
+        tcpEnabled = false;
+
+        if (!TryDecodeControl(buffer, length, TypePong, cipher, out var body))
+            return false;
+
+        if (body.Length == expectedTokenLength)
+        {
+            // старый формат PONG: тело = только маркер
+            token = body;
+            return true;
+        }
+
+        if (body.Length == expectedTokenLength + 1)
+        {
+            tcpEnabled = body[^1] == 1;
+            token = body.AsSpan(0, expectedTokenLength).ToArray();
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Собирает TCP-кадр открытия соединения (сервер -> клиент).
+    /// Тело: [4] IPv4 реального клиента [2] TCP-порт [4] connId.
+    /// </summary>
+    public static byte[] EncodeTcpOpen(IPAddress clientIp, ushort clientPort, uint connId, TunnelCipher? cipher)
+    {
+        var body = new byte[10];
+        var o = 0;
+
+        var ip = clientIp.GetAddressBytes();
+        if (ip.Length != 4)
+            throw new ArgumentException("Поддерживается только IPv4.", nameof(clientIp));
+        Array.Copy(ip, 0, body, 0, 4);
+        o += 4;
+
+        WriteU16(body, ref o, clientPort);
+        WriteU32(body, ref o, connId);
+        return EncodeControl(TypeTcpOpen, body, cipher);
+    }
+
+    /// <summary>
+    /// Разбирает TCP-кадр открытия соединения.
+    /// </summary>
+    public static bool TryDecodeTcpOpen(
+        byte[] buffer, int length, TunnelCipher? cipher,
+        out IPAddress clientIp, out ushort clientPort, out uint connId)
+    {
+        clientIp = IPAddress.Any;
+        clientPort = 0;
+        connId = 0;
+
+        if (!TryDecodeControl(buffer, length, TypeTcpOpen, cipher, out var body) || body.Length != 10)
+            return false;
+
+        var o = 0;
+        var ip = new byte[4];
+        Array.Copy(body, o, ip, 0, 4);
+        o += 4;
+        clientIp = new IPAddress(ip);
+        clientPort = ReadU16(body, ref o);
+        connId = ReadU32(body, ref o);
+        return true;
+    }
+
+    /// <summary>
+    /// Собирает TCP-кадр данных. Тело: [4] connId [N] данные.
+    /// </summary>
+    public static byte[] EncodeTcpData(uint connId, ReadOnlySpan<byte> payload, TunnelCipher? cipher)
+    {
+        var body = new byte[TcpHeaderLength + payload.Length];
+        var o = 0;
+        WriteU32(body, ref o, connId);
+        payload.CopyTo(body.AsSpan(o));
+        return EncodeControl(TypeTcpData, body, cipher);
+    }
+
+    /// <summary>
+    /// Разбирает TCP-кадр данных.
+    /// </summary>
+    public static bool TryDecodeTcpData(byte[] buffer, int length, TunnelCipher? cipher, out uint connId, out byte[] payload)
+    {
+        connId = 0;
+        payload = Array.Empty<byte>();
+
+        if (!TryDecodeControl(buffer, length, TypeTcpData, cipher, out var body) || body.Length < TcpHeaderLength)
+            return false;
+
+        var o = 0;
+        connId = ReadU32(body, ref o);
+        payload = new byte[body.Length - o];
+        Array.Copy(body, o, payload, 0, payload.Length);
+        return true;
+    }
+
+    /// <summary>
+    /// Собирает TCP-кадр закрытия соединения. Тело: [4] connId.
+    /// </summary>
+    public static byte[] EncodeTcpClose(uint connId, TunnelCipher? cipher)
+    {
+        var body = new byte[TcpHeaderLength];
+        var o = 0;
+        WriteU32(body, ref o, connId);
+        return EncodeControl(TypeTcpClose, body, cipher);
+    }
+
+    /// <summary>
+    /// Разбирает TCP-кадр закрытия соединения.
+    /// </summary>
+    public static bool TryDecodeTcpClose(byte[] buffer, int length, TunnelCipher? cipher, out uint connId)
+    {
+        connId = 0;
+
+        if (!TryDecodeControl(buffer, length, TypeTcpClose, cipher, out var body) || body.Length != TcpHeaderLength)
+            return false;
+
+        var o = 0;
+        connId = ReadU32(body, ref o);
+        return true;
+    }
+
     private static byte[] BuildDataFrame(IPAddress clientIp, ushort clientPort, ReadOnlySpan<byte> payload)
     {
         if (clientIp.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork)
@@ -218,8 +376,24 @@ public static class Frame
         return value;
     }
 
+    private static uint ReadU32(byte[] buffer, ref int offset)
+    {
+        var value = ((uint)buffer[offset] << 24) | ((uint)buffer[offset + 1] << 16) |
+                    ((uint)buffer[offset + 2] << 8) | buffer[offset + 3];
+        offset += 4;
+        return value;
+    }
+
     private static void WriteU16(byte[] buffer, ref int offset, ushort value)
     {
+        buffer[offset++] = (byte)(value >> 8);
+        buffer[offset++] = (byte)value;
+    }
+
+    private static void WriteU32(byte[] buffer, ref int offset, uint value)
+    {
+        buffer[offset++] = (byte)(value >> 24);
+        buffer[offset++] = (byte)(value >> 16);
         buffer[offset++] = (byte)(value >> 8);
         buffer[offset++] = (byte)value;
     }
