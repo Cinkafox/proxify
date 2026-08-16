@@ -16,6 +16,9 @@ namespace Proxify.Common;
 ///                0x05 = TCP: открытие соединения (сервер -> клиент)
 ///                0x06 = TCP: данные соединения (в обе стороны)
 ///                0x07 = TCP: закрытие соединения (в обе стороны)
+///                0x08 = AUTH (рукопожатие, без шифрования) — подпись ECDSA
+///                0x09 = AUTH_ACK (рукопожатие, без шифрования) — эфемерный ключ
+///                       сервера + зашифрованное «доказательство»
 ///                 для 0x03/0x04 тело = маркер (например, случайные байты),
 ///                 для PONG к маркеру добавляется байт признака TCP-проксирования;
 ///                 при заданном cipher тело шифруется как [12]nonce [16]tag [M]ciphertext
@@ -34,6 +37,21 @@ namespace Proxify.Common;
 ///   TcpOpen (0x05): [4] IPv4 реального клиента [2] TCP-порт [4] connId
 ///   TcpData (0x06): [4] connId [N] данные
 ///   TcpClose(0x07): [4] connId
+///
+/// Кадр AUTH (0x08) передаётся БЕЗ шифрования (plaintext):
+///
+///   [1] версия = 1
+///   [32] X эфемерного ключа ECDH клиента
+///   [32] Y эфемерного ключа ECDH клиента
+///   [16] nonce
+///   [64] подпись ECDSA (IEEE P1363) по "proxify-auth-v1"||X||Y||nonce
+///
+/// Кадр AUTH_ACK (0x09) также БЕЗ шифрования оболочки:
+///
+///   [32] X эфемерного ключа ECDH сервера
+///   [32] Y эфемерного ключа ECDH сервера
+///   [N] «доказательство», зашифрованное сессионным ключом
+///       (см. TunnelCipher.Wrap и ClientConfig.EncodeProof)
 /// </summary>
 public static class Frame
 {
@@ -45,10 +63,15 @@ public static class Frame
     public const byte TypeTcpOpen = 0x05;
     public const byte TypeTcpData = 0x06;
     public const byte TypeTcpClose = 0x07;
+    public const byte TypeAuth = 0x08;
+    public const byte TypeAuthAck = 0x09;
 
     public const int HeaderLength = 3;
     public const int InnerHeaderLength = 11;
     public const int TcpHeaderLength = 4;
+
+    /// <summary>Длина тела кадра AUTH: версия + X + Y + nonce + подпись.</summary>
+    public const int AuthBodyLength = 1 + 32 + 32 + 16 + 64;
 
     /// <summary>
     /// Собирает туннельный кадр. Если передан cipher — кадр шифруется (тип 0x02),
@@ -314,6 +337,115 @@ public static class Frame
         var o = 0;
         connId = ReadU32(body, ref o);
         return true;
+    }
+
+    /// <summary>
+    /// Собирает кадр AUTH (рукопожатие, без шифрования оболочки).
+    /// Тело: [1] версия [32] X [32] Y [16] nonce [64] подпись.
+    /// </summary>
+    public static byte[] EncodeAuth(
+        byte version,
+        ReadOnlySpan<byte> ephX,
+        ReadOnlySpan<byte> ephY,
+        ReadOnlySpan<byte> nonce,
+        ReadOnlySpan<byte> signature)
+    {
+        if (ephX.Length != 32 || ephY.Length != 32 || nonce.Length != 16 || signature.Length != 64)
+            throw new ArgumentException("Неверная длина полей кадра AUTH.");
+
+        var frame = new byte[HeaderLength + AuthBodyLength];
+        var o = 0;
+        WriteU16(frame, ref o, Magic);
+        frame[o++] = TypeAuth;
+        frame[o++] = version;
+        ephX.CopyTo(frame.AsSpan(o));
+        o += ephX.Length;
+        ephY.CopyTo(frame.AsSpan(o));
+        o += ephY.Length;
+        nonce.CopyTo(frame.AsSpan(o));
+        o += nonce.Length;
+        signature.CopyTo(frame.AsSpan(o));
+        return frame;
+    }
+
+    /// <summary>
+    /// Разбирает кадр AUTH.
+    /// </summary>
+    public static bool TryDecodeAuth(
+        byte[] buffer, int length,
+        out byte version,
+        out byte[] ephX, out byte[] ephY, out byte[] nonce, out byte[] signature)
+    {
+        version = 0;
+        ephX = ephY = nonce = signature = Array.Empty<byte>();
+
+        if (buffer == null || length != HeaderLength + AuthBodyLength)
+            return false;
+
+        var o = 0;
+        if (ReadU16(buffer, ref o) != Magic)
+            return false;
+        if (buffer[o++] != TypeAuth)
+            return false;
+
+        version = buffer[o++];
+        ephX = Slice(buffer, ref o, 32);
+        ephY = Slice(buffer, ref o, 32);
+        nonce = Slice(buffer, ref o, 16);
+        signature = Slice(buffer, ref o, 64);
+        return true;
+    }
+
+    /// <summary>
+    /// Собирает кадр AUTH_ACK (рукопожатие, без шифрования оболочки).
+    /// Тело: [32] X [32] Y [N] зашифрованное «доказательство».
+    /// </summary>
+    public static byte[] EncodeAuthAck(ReadOnlySpan<byte> sX, ReadOnlySpan<byte> sY, ReadOnlySpan<byte> wrappedProof)
+    {
+        if (sX.Length != 32 || sY.Length != 32)
+            throw new ArgumentException("Неверная длина полей кадра AUTH_ACK.");
+
+        var frame = new byte[HeaderLength + 64 + wrappedProof.Length];
+        var o = 0;
+        WriteU16(frame, ref o, Magic);
+        frame[o++] = TypeAuthAck;
+        sX.CopyTo(frame.AsSpan(o));
+        o += 32;
+        sY.CopyTo(frame.AsSpan(o));
+        o += 32;
+        wrappedProof.CopyTo(frame.AsSpan(o));
+        return frame;
+    }
+
+    /// <summary>
+    /// Разбирает кадр AUTH_ACK.
+    /// </summary>
+    public static bool TryDecodeAuthAck(byte[] buffer, int length, out byte[] sX, out byte[] sY, out byte[] wrappedProof)
+    {
+        sX = sY = wrappedProof = Array.Empty<byte>();
+
+        if (buffer == null || length <= HeaderLength + 64)
+            return false;
+
+        var o = 0;
+        if (ReadU16(buffer, ref o) != Magic)
+            return false;
+        if (buffer[o++] != TypeAuthAck)
+            return false;
+
+        sX = Slice(buffer, ref o, 32);
+        sY = Slice(buffer, ref o, 32);
+        wrappedProof = new byte[length - o];
+        Array.Copy(buffer, o, wrappedProof, 0, wrappedProof.Length);
+        return true;
+    }
+
+    private static byte[] Slice(byte[] buffer, ref int offset, int count)
+    {
+        var result = new byte[count];
+        Array.Copy(buffer, offset, result, 0, count);
+        offset += count;
+        return result;
     }
 
     private static byte[] BuildDataFrame(IPAddress clientIp, ushort clientPort, ReadOnlySpan<byte> payload)

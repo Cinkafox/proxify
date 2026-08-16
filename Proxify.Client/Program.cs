@@ -1,19 +1,16 @@
-﻿using System.Net;
-using System.Net.Sockets;
+﻿using System.Net.Sockets;
 using System.Text;
+using System.Security.Cryptography;
 using Proxify.Client;
 using Proxify.Common;
 
 Console.OutputEncoding = Encoding.UTF8;
 
 var cli = new ArgParser("Proxify.Client")
-    .Add("server", "IP или имя хоста прокси-сервера (машина A). Трафик туннеля уходит на его --tunnel-port", required: true, shortName: 's')
-    .Add("tunnel-port", "UDP-порт туннеля ПРОКСИ-СЕРВЕРА (машины A); должен совпадать с --tunnel-port сервера", required: true, shortName: 't')
-    .Add("game-ip", "IP игрового сервера, обычно 127.0.0.1", shortName: 'g', defaultValue: "127.0.0.1")
-    .Add("game-port", "UDP-порт игрового сервера", defaultValue: "7777")
-    .Add("capture", "Перехватывать ответы игрового сервера (true/false)", defaultValue: "true")
-    .Add("aliases", "Добавлять IP клиентов в loopback-алиасы (true/false)", defaultValue: "true")
-    .Add("key", "Ключ шифрования (одинаковый у сервера и клиента). Обязателен — кадры всегда шифруются AES-256-GCM", required: true, shortName: 'k');
+    .Add("server", "Адрес прокси-сервера (машина A): host или host:порт туннеля. Если порт не указан, используется --tunnel-port", shortName: 's')
+    .Add("tunnel-port", "UDP-порт туннеля ПРОКСИ-СЕРВЕРА (машины A), если он не указан в --server", shortName: 't')
+    .Add("key", "Путь к закрытому ключу клиента (PEM, PKCS#8). Создаётся командой --keygen", shortName: 'k')
+    .Add("keygen", "Сгенерировать пару ключей в указанном каталоге (client-private.pem, client-public.pem) и выйти", shortName: 'g');
 
 if (!cli.TryParse(args))
 {
@@ -24,22 +21,43 @@ if (!cli.TryParse(args))
 if (cli.HelpRequested)
     return 0;
 
-var serverHost = cli.Get("server")!;
-if (string.IsNullOrWhiteSpace(serverHost))
+// --- Режим генерации ключей ---
+var keygenDir = cli.Get("keygen");
+if (!string.IsNullOrWhiteSpace(keygenDir))
 {
-    Console.WriteLine("[ошибка конфигурации] '--server' не может быть пустым (ожидается IP или имя хоста машины A).");
+    if (!TunnelKeys.TryGenerateKeyPair(keygenDir, out var privatePath, out var publicPath, out var keygenError))
+    {
+        Console.WriteLine($"[ошибка конфигурации] {keygenError}");
+        return 1;
+    }
+    Console.WriteLine($"Закрытый ключ клиента : {privatePath}");
+    Console.WriteLine($"Публичный ключ клиента: {publicPath}");
+    Console.WriteLine("Передайте файл client-public.pem на машину A и укажите его в конфиге сервера.");
+    Console.WriteLine("На машине A можно сгенерировать шаблон конфига:");
+    Console.WriteLine("  Proxify.Server --configgen <каталог с client-public.pem>");
+    return 0;
+}
+
+var serverText = cli.Get("server")!;
+if (string.IsNullOrWhiteSpace(serverText))
+{
+    Console.WriteLine("[ошибка конфигурации] '--server' не может быть пустым (ожидается host или host:порт машины A).");
     cli.PrintUsage();
     return 1;
 }
 
-if (!NetUtils.TryParsePort(cli.Get("tunnel-port"), out var tunnelPort))
+// Разбор host[:порт]. Порт может быть указан в --server или отдельным --tunnel-port.
+var (serverHost, inlinePort) = SplitHostPort(serverText);
+var tunnelPortText = inlinePort ?? cli.Get("tunnel-port");
+
+if (string.IsNullOrWhiteSpace(tunnelPortText) ||
+    !NetUtils.TryParsePort(tunnelPortText, out var tunnelPort))
 {
-    Console.WriteLine($"[ошибка конфигурации] '--tunnel-port {cli.Get("tunnel-port")}' не является допустимым (ожидается число от 1 до 65535).");
+    Console.WriteLine("[ошибка конфигурации] Не указан порт туннеля. Добавьте его к --server (host:порт) или задайте --tunnel-port.");
     cli.PrintUsage();
     return 1;
 }
 
-// Адрес прокси-сервера: хост из --server, порт туннеля из --tunnel-port.
 if (!NetUtils.TryParseEndpoint($"{serverHost}:{tunnelPort}", out var proxyServer))
 {
     Console.WriteLine($"[ошибка конфигурации] Не удалось разрешить адрес прокси-сервера '{serverHost}'.");
@@ -47,56 +65,30 @@ if (!NetUtils.TryParseEndpoint($"{serverHost}:{tunnelPort}", out var proxyServer
     return 1;
 }
 
-if (!IPAddress.TryParse(cli.Get("game-ip"), out var gameIp))
+var keyPath = cli.Get("key")!;
+if (string.IsNullOrWhiteSpace(keyPath) || !File.Exists(keyPath))
 {
-    Console.WriteLine($"[ошибка конфигурации] '--game-ip {cli.Get("game-ip")}' не является IP-адресом.");
-    cli.PrintUsage();
-    return 1;
-}
-if (gameIp.AddressFamily != AddressFamily.InterNetwork)
-{
-    Console.WriteLine("[ошибка конфигурации] '--game-ip' должен быть IPv4-адресом.");
+    Console.WriteLine($"[ошибка конфигурации] Закрытый ключ не найден: '{keyPath}'. Создайте его командой --keygen.");
     cli.PrintUsage();
     return 1;
 }
 
-if (!NetUtils.TryParsePort(cli.Get("game-port"), out var gamePort))
+ECDsa identityKey;
+try
 {
-    Console.WriteLine($"[ошибка конфигурации] '--game-port {cli.Get("game-port")}' не является допустимым (ожидается число от 1 до 65535).");
-    cli.PrintUsage();
+    identityKey = TunnelKeys.ImportPrivatePem(File.ReadAllText(keyPath));
+    Console.WriteLine($"[диагностика] Закрытый ключ загружен: {keyPath}");
+}
+catch (Exception ex)
+{
+    Console.WriteLine($"[ошибка конфигурации] Не удалось загрузить закрытый ключ '{keyPath}': {ex.Message}");
     return 1;
 }
 
-if (!bool.TryParse(cli.Get("capture"), out var captureReplies))
-{
-    Console.WriteLine($"[ошибка конфигурации] '--capture {cli.Get("capture")}' должен быть true или false.");
-    cli.PrintUsage();
-    return 1;
-}
-
-if (!bool.TryParse(cli.Get("aliases"), out var loopbackAliases))
-{
-    Console.WriteLine($"[ошибка конфигурации] '--aliases {cli.Get("aliases")}' должен быть true или false.");
-    cli.PrintUsage();
-    return 1;
-}
-
-var key = cli.Get("key")!;
-if (string.IsNullOrWhiteSpace(key))
-{
-    Console.WriteLine("[ошибка конфигурации] '--key' не может быть пустым.");
-    cli.PrintUsage();
-    return 1;
-}
-
-var cipher = TunnelCipher.FromPassphrase(key);
-
-using var session = new ProxySession(proxyServer, gameIp, (ushort)gamePort, tunnelPort, captureReplies, loopbackAliases, cipher);
+using var session = new ProxySession(proxyServer, identityKey);
 
 try
 {
-    var (handshakeOk, serverTcpEnabled) = await session.HandshakeAsync();
-    session.ServerTcp.Set(serverTcpEnabled);
     await session.RunAsync();
 }
 catch (SocketException ex) when (ex.SocketErrorCode == SocketError.AccessDenied)
@@ -120,3 +112,19 @@ catch (Exception ex)
 }
 
 return 0;
+
+/// <summary>
+/// Разделяет "host[:порт]" на хост и порт. Возвращает порт только если он числовой.
+/// </summary>
+static (string Host, string? Port) SplitHostPort(string text)
+{
+    var idx = text.LastIndexOf(':');
+    if (idx <= 0)
+        return (text, null);
+
+    var port = text[(idx + 1)..];
+    if (port.Length > 0 && port.All(char.IsAsciiDigit))
+        return (text[..idx], port);
+
+    return (text, null);
+}

@@ -4,6 +4,12 @@
 #   node-a — публичный прокси-сервер (машина A)
 #   node-b — прокси-клиент + игровой UDP-сервер (машина B)
 #
+# Перед запуском (один раз):
+#   Proxify.Client --keygen ./deploy/            # пара ключей
+#   Proxify.Server --configgen ./deploy/         # server.json (использует
+#                                                # client-public.pem в ./deploy/)
+#   При необходимости отредактируйте ./deploy/server.json (порт игроков и т.п.).
+#
 # Запуск:
 #   docker compose -f docker-compose.local.yml up -d --build
 #
@@ -21,9 +27,6 @@
 # Туннель живёт на сервере: node-a слушает 27015 (игроки) и 5600 (туннель),
 # node-b сам устанавливает исходящее соединение на 172.30.0.10:5600 и портов
 # наружу не открывает. Как и в реальном сценарии, открытые порты только у A.
-#
-# Ключ шифрования берётся из переменной окружения KEY или .env-файла.
-#   $env:KEY = "my-secret"; docker compose -f docker-compose.local.yml up -d --build
 # ============================================================================
 
 services:
@@ -32,14 +35,14 @@ services:
       context: .
       target: server
     command:
-      # --port [порт игроков] --tunnel-port [порт туннеля] --key
-      # Адрес прокси-клиента определяется автоматически по первому кадру туннеля.
-      - "--port"
-      - "27015"
+      # --config [путь к конфигу в контейнере] --tunnel-port [порт туннеля]
+      - "--config"
+      - "/app/server.json"
       - "--tunnel-port"
       - "5600"
-      - "--key"
-      - "${KEY:-example-secret-key}"
+    volumes:
+      - "${SERVER_CONFIG:-./deploy/server.json}:/app/server.json:ro"
+      - "${CLIENT_PUBLIC_KEY:-./deploy/client-public.pem}:/app/client-public.pem:ro"
     ports:
       - "27015:27015/udp"       # сюда подключаются игроки
       - "5600:5600/udp"         # порт туннеля — на машине A открыты оба порта
@@ -54,22 +57,15 @@ services:
       target: client
     entrypoint: ["/app/machine-b-entrypoint.sh"]   # поднимает игровой сервер и клиента
     command:
-      # --server [прокси-сервер] --tunnel-port [порт туннеля сервера] --game-ip
-      #            --game-port --capture true/false --aliases true/false --key
+      # --server [машина A] --tunnel-port [порт туннеля A] --key [закрытый ключ]
       - "--server"
       - "172.30.0.10"           # машина A (без порта — туннель идёт на её порт туннеля)
       - "--tunnel-port"
       - "5600"                  # порт туннеля машины A
-      - "--game-ip"
-      - "127.0.0.1"             # игровой сервер в этом же контейнере
-      - "--game-port"
-      - "7777"
-      - "--capture"
-      - "true"                  # перехватывать ответы игрового сервера
-      - "--aliases"
-      - "true"                  # добавлять IP игроков на lo (ip addr add)
       - "--key"
-      - "${KEY:-example-secret-key}"
+      - "/app/client-private.pem"
+    volumes:
+      - "${CLIENT_KEY:-./deploy/client-private.pem}:/app/client-private.pem:ro"
     cap_add:
       - NET_RAW                 # raw-сокеты (впрыск пакетов, сниффер)
       - NET_ADMIN               # ip addr add/del на loopback

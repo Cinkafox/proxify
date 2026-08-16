@@ -23,14 +23,18 @@ public sealed class ServerTcpStatus
 /// <summary>
 /// Базовое TCP-проксирование через UDP-туннель (без подмены исходного IP).
 ///
-/// Реальный клиент устанавливает TCP-соединение с прокси-сервером (--port);
-/// сервер присваивает соединению connId и уведомляет прокси-клиент кадром
-/// TcpOpen. Прокси-клиент соединяется с локальным игровым сервером
-/// (--game-ip:--game-port) по TCP, данные в обе стороны передаются кадрами
-/// TcpData, закрытие — TcpClose.
+/// Реальный клиент устанавливает TCP-соединение с прокси-сервером (порт клиента
+/// из конфига); сервер присваивает соединению connId и уведомляет прокси-клиент
+/// кадром TcpOpen. Прокси-клиент соединяется с локальным игровым сервером
+/// (gameIp:gamePort) по TCP, данные в обе стороны передаются кадрами TcpData,
+/// закрытие — TcpClose.
 ///
 /// Работает только если прокси-сервер включил TCP-проксирование — клиент узнаёт
-/// об этом из PONG (см. <see cref="ServerTcpStatus"/>) и не имеет собственного флага.
+/// об этом из PONG/конфига (см. <see cref="ServerTcpStatus"/>) и не имеет
+/// собственного флага.
+///
+/// Сессионный ключ может меняться при повторной авторизации, поэтому шифрование
+/// запрашивается через <see cref="Func{TunnelCipher}"/>, а не фиксируется.
 ///
 /// Ограничение: игровой сервер видит соединения с адреса машины B, а не с
 /// адреса реального клиента (TCP не позволяет подменять source как UDP).
@@ -41,7 +45,7 @@ public sealed class TcpRelay : IDisposable
     private readonly ushort _gamePort;
     private readonly UdpClient _tunnel;
     private readonly IPEndPoint _proxyServer;
-    private readonly TunnelCipher? _cipher;
+    private readonly Func<TunnelCipher?> _cipherGetter;
     private readonly TunnelStats _stats;
     private readonly ServerTcpStatus _serverTcp;
     private readonly ConcurrentDictionary<uint, TcpSession> _sessions = new();
@@ -52,7 +56,7 @@ public sealed class TcpRelay : IDisposable
         ushort gamePort,
         UdpClient tunnel,
         IPEndPoint proxyServer,
-        TunnelCipher? cipher,
+        Func<TunnelCipher?> cipherGetter,
         TunnelStats stats,
         ServerTcpStatus serverTcp)
     {
@@ -60,7 +64,7 @@ public sealed class TcpRelay : IDisposable
         _gamePort = gamePort;
         _tunnel = tunnel;
         _proxyServer = proxyServer;
-        _cipher = cipher;
+        _cipherGetter = cipherGetter;
         _stats = stats;
         _serverTcp = serverTcp;
     }
@@ -93,14 +97,15 @@ public sealed class TcpRelay : IDisposable
 
     private void HandleOpen(byte[] buffer, int length)
     {
-        if (!Frame.TryDecodeTcpOpen(buffer, length, _cipher, out _, out _, out var connId))
+        var cipher = _cipherGetter();
+        if (cipher == null || !Frame.TryDecodeTcpOpen(buffer, length, cipher, out _, out _, out var connId))
         {
             Interlocked.Increment(ref _stats.BadFrames);
             Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Не удалось разобрать TcpOpen.");
             return;
         }
 
-        var session = new TcpSession(connId, _gameIp, _gamePort, _tunnel, _proxyServer, _cipher, _stats, this);
+        var session = new TcpSession(connId, _gameIp, _gamePort, _tunnel, _proxyServer, _cipherGetter, _stats, this);
         if (_sessions.TryAdd(connId, session))
         {
             _ = Task.Run(session.RunAsync);
@@ -114,7 +119,8 @@ public sealed class TcpRelay : IDisposable
 
     private void HandleData(byte[] buffer, int length)
     {
-        if (!Frame.TryDecodeTcpData(buffer, length, _cipher, out var connId, out var payload))
+        var cipher = _cipherGetter();
+        if (cipher == null || !Frame.TryDecodeTcpData(buffer, length, cipher, out var connId, out var payload))
         {
             Interlocked.Increment(ref _stats.BadFrames);
             return;
@@ -133,7 +139,8 @@ public sealed class TcpRelay : IDisposable
 
     private void HandleClose(byte[] buffer, int length)
     {
-        if (!Frame.TryDecodeTcpClose(buffer, length, _cipher, out var connId))
+        var cipher = _cipherGetter();
+        if (cipher == null || !Frame.TryDecodeTcpClose(buffer, length, cipher, out var connId))
         {
             Interlocked.Increment(ref _stats.BadFrames);
             return;
@@ -159,7 +166,7 @@ public sealed class TcpRelay : IDisposable
         private readonly ushort _gamePort;
         private readonly UdpClient _tunnel;
         private readonly IPEndPoint _proxyServer;
-        private readonly TunnelCipher? _cipher;
+        private readonly Func<TunnelCipher?> _cipherGetter;
         private readonly TunnelStats _stats;
         private readonly TcpRelay _relay;
 
@@ -175,7 +182,7 @@ public sealed class TcpRelay : IDisposable
             ushort gamePort,
             UdpClient tunnel,
             IPEndPoint proxyServer,
-            TunnelCipher? cipher,
+            Func<TunnelCipher?> cipherGetter,
             TunnelStats stats,
             TcpRelay relay)
         {
@@ -184,7 +191,7 @@ public sealed class TcpRelay : IDisposable
             _gamePort = gamePort;
             _tunnel = tunnel;
             _proxyServer = proxyServer;
-            _cipher = cipher;
+            _cipherGetter = cipherGetter;
             _stats = stats;
             _relay = relay;
         }
@@ -272,7 +279,11 @@ public sealed class TcpRelay : IDisposable
                 if (read <= 0)
                     break;
 
-                var frame = Frame.EncodeTcpData(_connId, buffer.AsSpan(0, read), _cipher);
+                var cipher = _cipherGetter();
+                if (cipher == null)
+                    break;
+
+                var frame = Frame.EncodeTcpData(_connId, buffer.AsSpan(0, read), cipher);
                 try
                 {
                     await _tunnel.SendAsync(frame, _proxyServer);
@@ -306,9 +317,13 @@ public sealed class TcpRelay : IDisposable
             if (Interlocked.Exchange(ref _closeSent, 1) != 0)
                 return;
 
+            var cipher = _cipherGetter();
+            if (cipher == null)
+                return;
+
             try
             {
-                _tunnel.Send(Frame.EncodeTcpClose(_connId, _cipher), _proxyServer);
+                _tunnel.Send(Frame.EncodeTcpClose(_connId, cipher), _proxyServer);
             }
             catch (Exception)
             {

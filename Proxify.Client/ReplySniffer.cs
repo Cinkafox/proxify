@@ -14,6 +14,9 @@ namespace Proxify.Client;
 /// на этот IP маршрутизируются в loopback, где попадают в данный сокет.
 /// Ответ заворачивается в туннельный кадр и отправляется прокси-серверу, который
 /// доставляет его реальному клиенту. Требуются права администратора / root.
+///
+/// Сессионный ключ может меняться при повторной авторизации, поэтому шифрование
+/// запрашивается через <see cref="Func{TunnelCipher}"/>.
 /// </summary>
 public sealed class ReplySniffer : IDisposable
 {
@@ -22,7 +25,7 @@ public sealed class ReplySniffer : IDisposable
     private readonly ushort _gamePort;
     private readonly UdpClient _tunnel;
     private readonly IPEndPoint _proxyServer;
-    private readonly TunnelCipher? _cipher;
+    private readonly Func<TunnelCipher?> _cipherGetter;
     private readonly TunnelStats _stats;
     private readonly CancellationToken _cancellationToken;
     private readonly byte[] _buffer = new byte[65535];
@@ -33,7 +36,7 @@ public sealed class ReplySniffer : IDisposable
         ConcurrentDictionary<IPEndPoint, DateTime> knownClients,
         UdpClient tunnel,
         IPEndPoint proxyServer,
-        TunnelCipher? cipher,
+        Func<TunnelCipher?> cipherGetter,
         TunnelStats stats,
         CancellationToken cancellationToken)
     {
@@ -41,7 +44,7 @@ public sealed class ReplySniffer : IDisposable
         _gamePort = gamePort;
         _tunnel = tunnel;
         _proxyServer = proxyServer;
-        _cipher = cipher;
+        _cipherGetter = cipherGetter;
         _stats = stats;
         _cancellationToken = cancellationToken;
 
@@ -89,7 +92,10 @@ public sealed class ReplySniffer : IDisposable
                 continue;
 
             Interlocked.Increment(ref _stats.RepliesCaptured);
-            var frame = Frame.EncodeData(dstIp, dstPort, payload, _cipher);
+            var cipher = _cipherGetter();
+            if (cipher == null)
+                continue;
+            var frame = Frame.EncodeData(dstIp, dstPort, payload, cipher);
 
             try
             {

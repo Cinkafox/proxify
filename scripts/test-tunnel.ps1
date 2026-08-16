@@ -1,32 +1,59 @@
 ﻿param(
-    [string]$Key = ""
+    [string]$Key = "",
+    [string]$Config = "",
+    [int]$TunnelPort = 5600,
+    [int]$Port = 27015,
+    [int]$GamePort = 7777,
+    [switch]$Tcp = $true,
+    [switch]$NoTcp
 )
 
 $ErrorActionPreference = "Stop"
-
-if ([string]::IsNullOrEmpty($Key)) {
-    throw "Сервер требует ключ шифрования. Задайте: pwsh scripts\test-tunnel.ps1 -Key `"my-secret`""
-}
-
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-# --- Вспомогательные функции (обязательно ДО основного потока: в PowerShell функции
-# --- вызываются только после того, как их определение уже выполнено) ---
+if ([string]::IsNullOrEmpty($Key)) {
+    throw "Требуется закрытый ключ клиента. Задайте: pwsh scripts\test-tunnel.ps1 -Key path\to\client-private.pem"
+}
+if (-not (Test-Path -LiteralPath $Key)) {
+    throw "Файл ключа не найден: $Key"
+}
 
-function Get-CipherKey {
-    param([string]$passphrase)
-    $sha = [System.Security.Cryptography.SHA256]::Create()
-    try {
-        $hash = $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($passphrase))
+# --- Вспомогательные функции (обязательно ДО основного потока) ---
+
+function Read-U16BE {
+    param([byte[]]$Bytes, [int]$Offset)
+    return (([int]$Bytes[$Offset] -shl 8) -bor [int]$Bytes[$Offset + 1])
+}
+
+function Read-U32BE {
+    param([byte[]]$Bytes, [int]$Offset)
+    return ([uint32]$Bytes[$Offset] -shl 24) -bor ([uint32]$Bytes[$Offset + 1] -shl 16) -bor `
+           ([uint32]$Bytes[$Offset + 2] -shl 8) -bor [uint32]$Bytes[$Offset + 3]
+}
+
+function Write-U16BE {
+    param([int]$Value)
+    return , [byte[]]@((($Value -shr 8) -band 0xFF), ($Value -band 0xFF))
+}
+
+function Write-U32BE {
+    param([uint32]$Value)
+    return , [byte[]]@(
+        (($Value -shr 24) -band 0xFF), (($Value -shr 16) -band 0xFF),
+        (($Value -shr 8) -band 0xFF), ($Value -band 0xFF))
+}
+
+function Concat-Bytes {
+    param([object[]]$Parts)
+    $total = 0
+    foreach ($p in $Parts) { $total += $p.Length }
+    $out = New-Object byte[] $total
+    $o = 0
+    foreach ($p in $Parts) {
+        [Array]::Copy($p, 0, $out, $o, $p.Length)
+        $o += $p.Length
     }
-    finally {
-        $sha.Dispose()
-    }
-    $salt = New-Object byte[] 16
-    [Array]::Copy($hash, 0, $salt, 0, 16)
-    $pbkdf2 = New-Object System.Security.Cryptography.Rfc2898DeriveBytes(
-        $passphrase, $salt, 100000, [System.Security.Cryptography.HashAlgorithmName]::SHA256)
-    return , $pbkdf2.GetBytes(32)
+    return , $out
 }
 
 function Wrap-Data {
@@ -41,11 +68,7 @@ function Wrap-Data {
         $tag = New-Object byte[] 16
         $gcm.Encrypt($nonce, $plain, $cipher, $tag)
 
-        $out = New-Object byte[] (12 + 16 + $cipher.Length)
-        [Array]::Copy($nonce, 0, $out, 0, 12)
-        [Array]::Copy($tag, 0, $out, 12, 16)
-        [Array]::Copy($cipher, 0, $out, 28, $cipher.Length)
-        return , $out
+        return , (Concat-Bytes @($nonce, $tag, $cipher))
     }
     finally {
         $gcm.Dispose()
@@ -54,7 +77,7 @@ function Wrap-Data {
 
 function Unwrap-Data {
     param([byte[]]$key, [byte[]]$blob)
-    if ($blob.Length -lt 28) { throw "Слишком короткий зашифрованный кадр" }
+    if ($blob.Length -lt 28) { throw "Слишком короткий зашифрованный блок" }
     $nonce = New-Object byte[] 12
     $tag = New-Object byte[] 16
     [Array]::Copy($blob, 0, $nonce, 0, 12)
@@ -73,79 +96,114 @@ function Unwrap-Data {
     }
 }
 
-function Decode-OuterFrame {
+function Receive-FromSocket {
+    param([System.Net.Sockets.UdpClient]$Socket, [int]$TimeoutMs, [string]$What)
+    $Socket.Client.ReceiveTimeout = $TimeoutMs
+    $ep = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
+    $data = $Socket.Receive([ref]$ep)
+    if ($data.Length -lt 3 -or $data[0] -ne 0xC0 -or $data[1] -ne 0xDE) {
+        throw "${What}: получен не наш кадр (нет magic)"
+    }
+    return , $data
+}
+
+function Build-AuthFrame {
+    param(
+        [System.Security.Cryptography.ECDsa]$Key,
+        [System.Security.Cryptography.ECDiffieHellman]$Ecdh,
+        [byte[]]$Nonce
+    )
+    $params = $Ecdh.ExportParameters($false)
+    $x = $params.Q.X
+    $y = $params.Q.Y
+    $info = [Text.Encoding]::UTF8.GetBytes("proxify-auth-v1")
+    $payload = Concat-Bytes @($info, $x, $y, $Nonce)
+    $sig = $Key.SignData($payload, [System.Security.Cryptography.HashAlgorithmName]::SHA256,
+        [System.Security.Cryptography.DSASignatureFormat]::IeeeP1363FixedFieldConcatenation)
+
+    $body = Concat-Bytes @([byte[]]@(1), $x, $y, $Nonce, $sig)
+    return , (Concat-Bytes @([byte[]]@(0xC0, 0xDE, 0x08), $body))
+}
+
+function Derive-SessionKey {
+    param(
+        [System.Security.Cryptography.ECDiffieHellman]$Ecdh,
+        [byte[]]$sX,
+        [byte[]]$sY
+    )
+    $peer = [System.Security.Cryptography.ECDiffieHellman]::Create()
+    try {
+        $ecp = [System.Security.Cryptography.ECParameters]::new()
+        $ecp.Curve = [System.Security.Cryptography.ECCurve+NamedCurves]::nistP256
+        $q = [System.Security.Cryptography.ECPoint]::new()
+        $q.X = $sX
+        $q.Y = $sY
+        $ecp.Q = $q
+        $peer.ImportParameters($ecp)
+        $secret = $Ecdh.DeriveRawSecretAgreement($peer.PublicKey)
+        try {
+            return , [System.Security.Cryptography.HKDF]::DeriveKey(
+                [System.Security.Cryptography.HashAlgorithmName]::SHA256,
+                $secret, 32, [Text.Encoding]::UTF8.GetBytes("proxify-session-v1"))
+        }
+        finally {
+            if ($secret) { [System.Security.Cryptography.CryptographicOperations]::ZeroMemory($secret) }
+        }
+    }
+    finally {
+        $peer.Dispose()
+    }
+}
+
+function Build-EncryptedDataFrame {
+    param([string]$ClientIp, [int]$ClientPort, [byte[]]$Payload, [byte[]]$Key)
+    $ipParts = $ClientIp.Split(".") | ForEach-Object { [int]$_ }
+    if ($ipParts.Count -ne 4) { throw "Неверный IP: $ClientIp" }
+    $inner = Concat-Bytes @(
+        [byte[]]@(0xC0, 0xDE, 0x01),
+        [byte[]]@($ipParts[0], $ipParts[1], $ipParts[2], $ipParts[3]),
+        (Write-U16BE $ClientPort),
+        (Write-U16BE $Payload.Length),
+        $Payload)
+    $blob = Wrap-Data -Key $Key -Plain $inner
+    return , (Concat-Bytes @([byte[]]@(0xC0, 0xDE, 0x02), $blob))
+}
+
+function Decode-DataFrame {
     param([byte[]]$Frame, [byte[]]$Key)
-    if ($Frame.Length -lt 3) { throw "Кадр слишком короткий" }
-    if (($Frame[0] -ne 0xC0) -or ($Frame[1] -ne 0xDE)) { throw "Неверный magic кадра" }
-
+    if ($Frame.Length -lt 3) { throw "Кадр данных слишком короткий" }
     $type = $Frame[2]
-    if ($type -ne 0x02) { throw "Получен незашифрованный кадр (0x$('{0:X2}' -f $type)), хотя ожидалось шифрование" }
-
+    if ($type -ne 0x02) { throw "Ожидался зашифрованный кадр (0x02), получен 0x$('{0:X2}' -f $type)" }
     $blob = New-Object byte[] ($Frame.Length - 3)
     [Array]::Copy($Frame, 3, $blob, 0, $blob.Length)
     $inner = Unwrap-Data -Key $Key -Blob $blob
 
-    return Decode-DataFrame -Frame $inner -WasEncrypted $true
-}
-
-function Decode-DataFrame {
-    param([byte[]]$Frame, [bool]$WasEncrypted)
-    if ($Frame.Length -lt 11) { throw "Внутренний кадр слишком короткий" }
-    if (($Frame[0] -ne 0xC0) -or ($Frame[1] -ne 0xDE)) { throw "Неверный magic внутреннего кадра" }
-    if ($Frame[2] -ne 0x01) { throw "Неверный тип внутреннего кадра" }
-
-    $ip = "$($Frame[3]).$($Frame[4]).$($Frame[5]).$($Frame[6])"
-    $port = (([int]$Frame[7]) -shl 8) -bor [int]$Frame[8]
-    $len = (([int]$Frame[9]) -shl 8) -bor [int]$Frame[10]
-    if ($len -gt ($Frame.Length - 11)) { throw "Длина полезной нагрузки превышает размер кадра" }
-
-    $payload = New-Object byte[] $len
-    [Array]::Copy($Frame, 11, $payload, 0, $len)
-
-    return [pscustomobject]@{
-        ClientIp     = $ip
-        ClientPort   = $port
-        Payload      = $payload
-        PayloadText  = [Text.Encoding]::UTF8.GetString($payload)
-        WasEncrypted = $WasEncrypted
+    if ($inner.Length -lt 11 -or $inner[0] -ne 0xC0 -or $inner[1] -ne 0xDE -or $inner[2] -ne 0x01) {
+        throw "Внутренний кадр данных неверного формата"
     }
-}
-
-function Build-OuterFrame {
-    param([string]$ClientIp, [int]$ClientPort, [byte[]]$Payload, [byte[]]$Key)
-
-    $ipParts = $ClientIp.Split(".") | ForEach-Object { [int]$_ }
-    if ($ipParts.Count -ne 4) { throw "Неверный IP: $ClientIp" }
-
-    $inner = New-Object byte[] (11 + $Payload.Length)
-    $inner[0] = 0xC0; $inner[1] = 0xDE; $inner[2] = 0x01
-    $inner[3] = $ipParts[0]; $inner[4] = $ipParts[1]
-    $inner[5] = $ipParts[2]; $inner[6] = $ipParts[3]
-    $inner[7] = ($ClientPort -shr 8); $inner[8] = ($ClientPort -band 0xFF)
-    $inner[9] = ($Payload.Length -shr 8); $inner[10] = ($Payload.Length -band 0xFF)
-    [Array]::Copy($Payload, 0, $inner, 11, $Payload.Length)
-
-    $blob = Wrap-Data -Key $Key -Plain $inner
-    $outer = New-Object byte[] (3 + $blob.Length)
-    $outer[0] = 0xC0; $outer[1] = 0xDE; $outer[2] = 0x02
-    [Array]::Copy($blob, 0, $outer, 3, $blob.Length)
-    return , $outer
+    $ip = "$($inner[3]).$($inner[4]).$($inner[5]).$($inner[6])"
+    $port = Read-U16BE -Bytes $inner -Offset 7
+    $len = Read-U16BE -Bytes $inner -Offset 9
+    if ($len -gt ($inner.Length - 11)) { throw "Длина полезной нагрузки превышает размер кадра" }
+    $payload = New-Object byte[] $len
+    [Array]::Copy($inner, 11, $payload, 0, $len)
+    return , [pscustomobject]@{
+        ClientIp    = $ip
+        ClientPort  = $port
+        Payload     = $payload
+        PayloadText = [Text.Encoding]::UTF8.GetString($payload)
+    }
 }
 
 function Build-ControlFrame {
     param([int]$Type, [byte[]]$Body, [byte[]]$Key)
-
     $blob = Wrap-Data -Key $Key -Plain $Body
-    $out = New-Object byte[] (3 + $blob.Length)
-    $out[0] = 0xC0; $out[1] = 0xDE; $out[2] = $Type
-    [Array]::Copy($blob, 0, $out, 3, $blob.Length)
-    return , $out
+    return , (Concat-Bytes @([byte[]]@(0xC0, 0xDE, [byte]$Type), $blob))
 }
 
 function Decode-EncryptedBody {
     param([byte[]]$Frame, [byte[]]$Key, [int]$ExpectedType)
     if ($Frame.Length -lt 3) { throw "Кадр слишком короткий" }
-    if (($Frame[0] -ne 0xC0) -or ($Frame[1] -ne 0xDE)) { throw "Неверный magic кадра" }
     $type = $Frame[2]
     if ($type -ne $ExpectedType) {
         throw "Неверный тип кадра 0x$('{0:X2}' -f $type), ожидался 0x$('{0:X2}' -f $ExpectedType)"
@@ -155,202 +213,259 @@ function Decode-EncryptedBody {
     return Unwrap-Data -Key $Key -Blob $blob
 }
 
-function Read-U32 {
-    param([byte[]]$Bytes, [int]$Offset)
-    return ([uint32]$Bytes[$Offset] -shl 24) -bor ([uint32]$Bytes[$Offset + 1] -shl 16) -bor `
-           ([uint32]$Bytes[$Offset + 2] -shl 8) -bor [uint32]$Bytes[$Offset + 3]
-}
-
 function Build-TcpDataFrame {
     param([uint32]$ConnId, [byte[]]$Payload, [byte[]]$Key)
-    $body = New-Object byte[] (4 + $Payload.Length)
-    $body[0] = ($ConnId -shr 24) -band 0xFF
-    $body[1] = ($ConnId -shr 16) -band 0xFF
-    $body[2] = ($ConnId -shr 8) -band 0xFF
-    $body[3] = $ConnId -band 0xFF
-    [Array]::Copy($Payload, 0, $body, 4, $Payload.Length)
+    $body = Concat-Bytes @((Write-U32BE $ConnId), $Payload)
     return Build-ControlFrame -Type 6 -Body $body -Key $Key
 }
 
-# --- Основной поток теста ---
+function Build-TcpCloseFrame {
+    param([uint32]$ConnId, [byte[]]$Key)
+    return Build-ControlFrame -Type 7 -Body (Write-U32BE $ConnId) -Key $Key
+}
 
-# Тест туннеля между Proxify.Server и (эмуляцией) Proxify.Client.
-# Запускает Proxify.Server, играет роль реального клиента и роль туннеля прокси-клиента.
-# Проверяет: клиент -> сервер -> кадр прокси-клиенту -> ответ серверу -> клиенту.
-# Шифрование AES-256-GCM обязательно (сервер не запускается без ключа).
-# Туннель теперь живёт на сервере: клиент шлёт кадры на его --tunnel-port,
-# а сам слушает эфемерный порт (как реальный прокси-клиент).
+# --- Подготовка ---
 
 $root = Split-Path -Parent $PSScriptRoot
 $serverDll = Join-Path $root "Proxify.Server\bin\Release\net8.0\Proxify.Server.dll"
-
 if (-not (Test-Path $serverDll)) {
     throw "Не найдена сборка: $serverDll. Сначала выполните: dotnet build Proxify.slnx -c Release"
 }
 
-$listenPort = 27015
-$tunnelPort = 5600
+# Загружаем закрытый ключ клиента и строим конфиг сервера (если не задан).
+$keyPem = Get-Content -LiteralPath $Key -Raw
+$identity = [System.Security.Cryptography.ECDsa]::Create()
+$identity.ImportFromPem($keyPem)
 
-$cipherKey = Get-CipherKey $Key
-Write-Host "=== Тест туннеля (AES-256-GCM, ключ обязателен) ==="
+$workDir = Join-Path $env:TEMP "proxify-test-$(Get-Random)"
+New-Item -ItemType Directory -Path $workDir | Out-Null
+
+$tcpEnabled = -not $NoTcp
+$configPath = $Config
+if ([string]::IsNullOrEmpty($configPath)) {
+    $publicPem = $identity.ExportSubjectPublicKeyInfoPem()
+    $publicKeyFile = Join-Path $workDir "client-public.pem"
+    Set-Content -LiteralPath $publicKeyFile -Value $publicPem -NoNewline
+    $configPath = Join-Path $workDir "server.json"
+    $cfgJson = @{
+        clients = @(
+            @{
+                name       = "test"
+                publicKey  = "client-public.pem"
+                port       = $Port
+                gameIp     = "127.0.0.1"
+                gamePort   = $GamePort
+                capture    = $true
+                aliases    = $false
+                tcp        = $tcpEnabled
+                tcpPort    = $Port
+            }
+        )
+    } | ConvertTo-Json -Depth 5
+    Set-Content -LiteralPath $configPath -Value $cfgJson
+}
+
+Write-Host "=== Тест туннеля (ECDSA P-256 + ECDH P-256 + HKDF + AES-256-GCM) ==="
+Write-Host "Конфиг сервера : $configPath"
+Write-Host "Закрытый ключ  : $Key"
+Write-Host "Порт туннеля   : $TunnelPort"
+Write-Host "Порт игроков   : $(if ([string]::IsNullOrEmpty($Config)) { $Port } else { '(из конфига)' })"
 Write-Host ""
 
-# 0a. Негативный тест защиты от чужого клиента: сервер разрешает прокси-клиента
-# только с адреса 203.0.113.9, а PING уходит с 127.0.0.1 — сервер должен отвергнуть его.
-Write-Host "[0a] Проверка защиты от другого клиента (--client-ip 203.0.113.9)..."
-$negPort = 27025
-$negTunnelPort = 5601
-$negProc = Start-Process dotnet -ArgumentList @($serverDll, "--port", "$negPort", "--tunnel-port", "$negTunnelPort", "--client-ip", "203.0.113.9", "--key", $Key) -PassThru -NoNewWindow
-Start-Sleep -Milliseconds 1200
-
-$negTunnel = New-Object System.Net.Sockets.UdpClient
-$negToken = New-Object byte[] 16
-$rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
-try { $rng.GetBytes($negToken) } finally { $rng.Dispose() }
-$negPing = Build-ControlFrame -Type 3 -Body $negToken -Key $cipherKey
-[void]$negTunnel.Send($negPing, $negPing.Length, "127.0.0.1", $negTunnelPort)
-$negTunnel.Client.ReceiveTimeout = 1200
-$negEp = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
-$rejected = $true
-try {
-    [void]$negTunnel.Receive([ref]$negEp)
-    $rejected = $false
-} catch [System.Net.Sockets.SocketException] {
-    # таймаут — сервер не ответил, чужой клиент отвергнут
-}
-$negTunnel.Dispose()
-Stop-Process -Id $negProc.Id -Force
-
-if (-not $rejected) {
-    throw "Сервер ответил на PING чужого клиента (защита --client-ip не сработала)"
-}
-Write-Host "    OK: сервер отверг чужого клиента (PING без ответа)."
-Write-Host ""
-
-# 0b. Основной сервер разрешает прокси-клиента с 127.0.0.1 (наш эмулируемый клиент).
-$serverArgs = @($serverDll, "--port", "$listenPort", "--tunnel-port", "$tunnelPort", "--tcp", "true", "--client-ip", "127.0.0.1", "--key", $Key)
-
-$proc = Start-Process dotnet -ArgumentList $serverArgs -PassThru -NoNewWindow
+$serverLog = Join-Path $workDir "server.out.log"
+$serverErr = Join-Path $workDir "server.err.log"
+$proc = Start-Process dotnet -ArgumentList @($serverDll, "--config", $configPath, "--tunnel-port", "$TunnelPort") `
+    -PassThru -NoNewWindow -RedirectStandardOutput $serverLog -RedirectStandardError $serverErr
 Start-Sleep -Milliseconds 1500
 
-$tunnel = New-Object System.Net.Sockets.UdpClient
-$client = New-Object System.Net.Sockets.UdpClient
-$client.Connect("127.0.0.1", $listenPort)
+$tunnel = $null
+$player = $null
 $tcpClient = $null
+$cfg = $null
 
 try {
-    # 0. Эмуляция прокси-клиента: PING на порт туннеля СЕРВЕРА — сервер определяет адрес туннеля
+    # Узнаём фактический порт игроков из конфига.
+    $rawCfg = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+    $playerPort = [int]$rawCfg.clients[0].port
+
+    # --- 0. Отрицательный тест: чужой ключ должен быть отвергнут ---
+    Write-Host "[0] Негативный тест: Auth чужим ключом должен быть отвергнут..."
+    $badKey = [System.Security.Cryptography.ECDsa]::Create()
+    try {
+        $badKey.GenerateKey([System.Security.Cryptography.ECCurve+NamedCurves]::nistP256)
+        $badEcdh = [System.Security.Cryptography.ECDiffieHellman]::Create([System.Security.Cryptography.ECCurve+NamedCurves]::nistP256)
+        try {
+            $badNonce = New-Object byte[] 16
+            $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+            try { $rng.GetBytes($badNonce) } finally { $rng.Dispose() }
+            $badAuth = Build-AuthFrame -Key $badKey -Ecdh $badEcdh -Nonce $badNonce
+            $negTunnel = New-Object System.Net.Sockets.UdpClient
+            try {
+                [void]$negTunnel.Send($badAuth, $badAuth.Length, "127.0.0.1", $TunnelPort)
+                $negTunnel.Client.ReceiveTimeout = 1200
+                $negEp = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
+                $rejected = $true
+                try {
+                    [void]$negTunnel.Receive([ref]$negEp)
+                    $rejected = $false
+                } catch [System.Net.Sockets.SocketException] {
+                    # таймаут — сервер не ответил, чужой клиент отвергнут
+                }
+            }
+            finally {
+                $negTunnel.Dispose()
+            }
+        }
+        finally {
+            $badEcdh.Dispose()
+        }
+    }
+    finally {
+        $badKey.Dispose()
+    }
+    if (-not $rejected) {
+        throw "Сервер ответил на Auth чужого ключа (защита не сработала)"
+    }
+    Write-Host "    OK: сервер отверг Auth чужого ключа."
+
+    # --- 1. Рукопожатие Auth / AuthAck ---
+    $tunnel = New-Object System.Net.Sockets.UdpClient
+    $nonce = New-Object byte[] 16
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $rng.GetBytes($nonce) } finally { $rng.Dispose() }
+    $ecdh = [System.Security.Cryptography.ECDiffieHellman]::Create([System.Security.Cryptography.ECCurve+NamedCurves]::nistP256)
+
+    $auth = Build-AuthFrame -Key $identity -Ecdh $ecdh -Nonce $nonce
+    [void]$tunnel.Send($auth, $auth.Length, "127.0.0.1", $TunnelPort)
+    Write-Host "[1] Auth отправлен, локальный порт туннеля $($tunnel.Client.LocalEndPoint.Port)"
+
+    $ack = Receive-FromSocket -Socket $tunnel -TimeoutMs 3000 -What "AuthAck"
+    if ($ack[2] -ne 0x09) { throw "Ожидался кадр AuthAck (0x09), получен 0x$('{0:X2}' -f $ack[2])" }
+    if ($ack.Length -lt 3 + 32 + 32 + 28) { throw "AuthAck слишком короткий" }
+    $sX = New-Object byte[] 32
+    $sY = New-Object byte[] 32
+    [Array]::Copy($ack, 3, $sX, 0, 32)
+    [Array]::Copy($ack, 35, $sY, 0, 32)
+    $wrappedProof = New-Object byte[] ($ack.Length - 67)
+    [Array]::Copy($ack, 67, $wrappedProof, 0, $wrappedProof.Length)
+
+    $sessionKey = Derive-SessionKey -Ecdh $ecdh -sX $sX -sY $sY
+
+    $proof = Unwrap-Data -Key $sessionKey -Blob $wrappedProof
+    if ($proof.Length -ne 23) { throw "Неверная длина proof: $($proof.Length)" }
+    for ($i = 0; $i -lt 16; $i++) {
+        if ($proof[$i] -ne $nonce[$i]) { throw "echo nonce не совпадает" }
+    }
+    $flags = $proof[16]
+    $gameIp = "$($proof[17]).$($proof[18]).$($proof[19]).$($proof[20])"
+    $gamePort = Read-U16BE -Bytes $proof -Offset 21
+    Write-Host "[2] AuthAck получен: сессионный ключ + конфиг (игра $gameIp`:$gamePort, flags=0x$('{0:X2}' -f $flags))"
+    if ($gamePort -ne $GamePort) { throw "Игровой порт из конфига не совпадает" }
+    Write-Host "    OK: конфиг от сервера получен и расшифрован."
+
+    # --- 2. PING / PONG ---
     $pingToken = New-Object byte[] 16
     $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
     try { $rng.GetBytes($pingToken) } finally { $rng.Dispose() }
-    $ping = Build-ControlFrame -Type 3 -Body $pingToken -Key $cipherKey
-    [void]$tunnel.Send($ping, $ping.Length, "127.0.0.1", $tunnelPort)
-    Write-Host "Прокси-клиент (эмуляция): локальный порт туннеля $($tunnel.Client.LocalEndPoint.Port) (эфемерный)"
-    Write-Host "[0] Прокси-клиент отправил PING на порт туннеля сервера 127.0.0.1:$tunnelPort"
-
-    $tunnel.Client.ReceiveTimeout = 3000
-    $ep = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
-    $pong = $tunnel.Receive([ref]$ep)
-    if (($pong.Length -lt 3) -or ($pong[0] -ne 0xC0) -or ($pong[1] -ne 0xDE) -or ($pong[2] -ne 4)) {
-        throw "Сервер не ответил PONG (ожидался кадр 0xC0 0xDE 0x04)"
+    $ping = Build-ControlFrame -Type 3 -Body $pingToken -Key $sessionKey
+    [void]$tunnel.Send($ping, $ping.Length, "127.0.0.1", $TunnelPort)
+    $pong = Receive-FromSocket -Socket $tunnel -TimeoutMs 3000 -What "PONG"
+    $pongBody = Decode-EncryptedBody -Frame $pong -Key $sessionKey -ExpectedType 4
+    if ($pongBody.Length -ne 17) { throw "Неверный формат PONG" }
+    for ($i = 0; $i -lt 16; $i++) {
+        if ($pongBody[$i] -ne $pingToken[$i]) { throw "Маркер PONG не совпадает с PING" }
     }
-    Write-Host "    OK: сервер ответил PONG — адрес туннеля определён."
+    $tcpFlag = $pongBody[16] -eq 1
+    Write-Host "[3] PONG OK (tcp-флаг из PONG: $tcpFlag)."
 
-    # 1. Реальный клиент отправляет пакет на прокси-сервер
-    $payload = [Text.Encoding]::UTF8.GetBytes("HELLO")
-    [void]$client.Send($payload, $payload.Length)
-    Write-Host "[1] Клиент отправил 'HELLO' на 127.0.0.1:$listenPort"
+    # --- 3. UDP: игрок -> сервер -> туннель -> игрок ---
+    $player = New-Object System.Net.Sockets.UdpClient
+    $player.Connect("127.0.0.1", $playerPort)
+    $hello = [Text.Encoding]::UTF8.GetBytes("HELLO")
+    [void]$player.Send($hello, $hello.Length)
+    Write-Host "[4] Игрок отправил 'HELLO' на 127.0.0.1:$playerPort"
 
-    # 2. Прокси-сервер должен доставить кадр на туннель прокси-клиента (эфемерный порт)
-    $frame = $tunnel.Receive([ref]$ep)
+    $frame = Receive-FromSocket -Socket $tunnel -TimeoutMs 3000 -What "кадр данных"
+    $decoded = Decode-DataFrame -Frame $frame -Key $sessionKey
+    Write-Host "[5] Кадр от сервера: клиент=$($decoded.ClientIp):$($decoded.ClientPort) payload='$($decoded.PayloadText)'"
+    if ($decoded.PayloadText -ne "HELLO") { throw "Кадр не соответствует ожидаемому формату" }
 
-    $decoded = Decode-OuterFrame -Frame $frame -Key $cipherKey
-    Write-Host "[2] Кадр от сервера: клиент=$($decoded.ClientIp):$($decoded.ClientPort) payload='$($decoded.PayloadText)' $($decoded.WasEncrypted)"
-
-    if ($decoded.PayloadText -ne "HELLO") {
-        throw "Кадр не соответствует ожидаемому формату"
-    }
-    Write-Host "    OK: кадр закодирован верно, настоящий адрес клиента сохранён."
-
-    # 3. Эмулируем прокси-клиента: отвечаем кадром обратно на порт туннеля сервера
     $reply = [Text.Encoding]::UTF8.GetBytes("REPLY")
-    $rf = Build-OuterFrame -ClientIp $decoded.ClientIp -ClientPort $decoded.ClientPort -Payload $reply -Key $cipherKey
-    [void]$tunnel.Send($rf, $rf.Length, "127.0.0.1", $tunnelPort)
-    Write-Host "[3] Эмуляция прокси-клиента отправила кадр-ответ на порт туннеля сервера 127.0.0.1:$tunnelPort"
+    $rf = Build-EncryptedDataFrame -ClientIp $decoded.ClientIp -ClientPort $decoded.ClientPort -Payload $reply -Key $sessionKey
+    [void]$tunnel.Send($rf, $rf.Length, "127.0.0.1", $TunnelPort)
+    Write-Host "[6] Эмуляция прокси-клиента отправила кадр-ответ."
 
-    # 4. Реальный клиент должен получить ответ от прокси-сервера
-    $client.Client.ReceiveTimeout = 3000
-    $ep2 = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
-    $got = $client.Receive([ref]$ep2)
-    $text2 = [Text.Encoding]::UTF8.GetString($got)
-    Write-Host "[4] Клиент получил: '$text2' от $($ep2.Address):$($ep2.Port)"
+    $player.Client.ReceiveTimeout = 3000
+    $playerEp = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
+    $got = $player.Receive([ref]$playerEp)
+    $gotText = [Text.Encoding]::UTF8.GetString($got)
+    Write-Host "[7] Игрок получил: '$gotText' от $($playerEp.Address):$($playerEp.Port)"
+    if ($gotText -ne "REPLY") { throw "Игрок получил неверный ответ" }
+    Write-Host "    OK: UDP-путь через туннель работает."
 
-    if ($text2 -ne "REPLY") {
-        throw "Клиент получил неверный ответ"
+    # --- 4. TCP (если включено в конфиге) ---
+    if ($tcpEnabled) {
+        Write-Host "[TCP 1] Игрок подключается по TCP к 127.0.0.1:$playerPort"
+        $tcpClient = New-Object System.Net.Sockets.TcpClient("127.0.0.1", $playerPort)
+        $tcpStream = $tcpClient.GetStream()
+        $tcpStream.ReadTimeout = 3000
+
+        $openFrame = Receive-FromSocket -Socket $tunnel -TimeoutMs 3000 -What "TcpOpen"
+        $openBody = Decode-EncryptedBody -Frame $openFrame -Key $sessionKey -ExpectedType 5
+        if ($openBody.Length -ne 10) { throw "Неверный формат TcpOpen" }
+        $connId = Read-U32BE -Bytes $openBody -Offset 6
+        Write-Host "[TCP 2] Сервер уведомил прокси-клиента о TCP-соединении (connId=$connId)"
+
+        $pingTcp = [Text.Encoding]::UTF8.GetBytes("PING-TCP")
+        $tcpStream.Write($pingTcp, 0, $pingTcp.Length)
+        $dataFrame = Receive-FromSocket -Socket $tunnel -TimeoutMs 3000 -What "TcpData"
+        $dataBody = Decode-EncryptedBody -Frame $dataFrame -Key $sessionKey -ExpectedType 6
+        if ($dataBody.Length -lt 4) { throw "Неверный формат TcpData" }
+        $recvConnId = Read-U32BE -Bytes $dataBody -Offset 0
+        $recvPayload = New-Object byte[] ($dataBody.Length - 4)
+        [Array]::Copy($dataBody, 4, $recvPayload, 0, $recvPayload.Length)
+        $recvText = [Text.Encoding]::UTF8.GetString($recvPayload)
+        Write-Host "[TCP 3] Туннель получил от игрока: '$recvText' (connId=$recvConnId)"
+        if ($recvText -ne "PING-TCP" -or $recvConnId -ne $connId) { throw "TCP-данные переданы в туннель неверно" }
+
+        $echo = [Text.Encoding]::UTF8.GetBytes($recvText)
+        $echoFrame = Build-TcpDataFrame -ConnId $connId -Payload $echo -Key $sessionKey
+        [void]$tunnel.Send($echoFrame, $echoFrame.Length, "127.0.0.1", $TunnelPort)
+        Write-Host "[TCP 4] Эмуляция игрового сервера ответила кадром TcpData."
+
+        $replyBuf = New-Object byte[] 1024
+        $gotLen = $tcpStream.Read($replyBuf, 0, $replyBuf.Length)
+        $gotTcp = [Text.Encoding]::UTF8.GetString($replyBuf, 0, $gotLen)
+        Write-Host "[TCP 5] Игрок (TCP) получил: '$gotTcp'"
+        if ($gotTcp -ne "PING-TCP") { throw "Игрок (TCP) получил неверный ответ" }
+        Write-Host "    OK: TCP-путь через туннель работает."
+
+        $tcpClient.Close()
+        $tcpClient = $null
+        $closeFrame = Receive-FromSocket -Socket $tunnel -TimeoutMs 3000 -What "TcpClose"
+        $closeBody = Decode-EncryptedBody -Frame $closeFrame -Key $sessionKey -ExpectedType 7
+        $closeConnId = Read-U32BE -Bytes $closeBody -Offset 0
+        if ($closeConnId -ne $connId) { throw "TcpClose с неверным connId" }
+        Write-Host "[TCP 6] Сервер уведомил о закрытии соединения (connId=$connId)."
     }
-    Write-Host "    OK: ответ доставлен клиенту от адреса прокси-сервера."
-
-    # =====================================================================
-    # 5. Тест TCP-проксирования (--tcp true)
-    # =====================================================================
-    Write-Host ""
-    Write-Host "[TCP 1] Реальный клиент подключается по TCP к 127.0.0.1:$listenPort"
-    $tcpClient = New-Object System.Net.Sockets.TcpClient("127.0.0.1", $listenPort)
-    $tcpStream = $tcpClient.GetStream()
-    $tcpStream.ReadTimeout = 3000
-
-    # Сервер должен прислать кадр TcpOpen (0x05): [4] ip клиента [2] порт [4] connId
-    $openFrame = $tunnel.Receive([ref]$ep)
-    $openBody = Decode-EncryptedBody -Frame $openFrame -Key $cipherKey -ExpectedType 5
-    $connId = Read-U32 -Bytes $openBody -Offset 6
-    Write-Host "[TCP 2] Сервер уведомил прокси-клиента о TCP-соединении (connId=$connId)"
-
-    # Данные реального клиента -> сервер -> кадр TcpData (0x06) в туннель
-    $pingTcp = [Text.Encoding]::UTF8.GetBytes("PING-TCP")
-    $tcpStream.Write($pingTcp, 0, $pingTcp.Length)
-    $dataFrame = $tunnel.Receive([ref]$ep)
-    $dataBody = Decode-EncryptedBody -Frame $dataFrame -Key $cipherKey -ExpectedType 6
-    $recvConnId = Read-U32 -Bytes $dataBody -Offset 0
-    $recvPayload = New-Object byte[] ($dataBody.Length - 4)
-    [Array]::Copy($dataBody, 4, $recvPayload, 0, $recvPayload.Length)
-    $recvText = [Text.Encoding]::UTF8.GetString($recvPayload)
-    Write-Host "[TCP 3] Туннель получил от клиента: '$recvText' (connId=$recvConnId)"
-
-    if ($recvText -ne "PING-TCP" -or $recvConnId -ne $connId) {
-        throw "TCP-данные клиента переданы в туннель неверно"
-    }
-    Write-Host "    OK: данные TCP-клиента доставлены в туннель."
-
-    # Эмуляция прокси-клиента: игровой сервер отвечает тем же текстом кадром TcpData
-    $echo = [Text.Encoding]::UTF8.GetBytes($recvText)
-    $rf = Build-TcpDataFrame -ConnId $connId -Payload $echo -Key $cipherKey
-    [void]$tunnel.Send($rf, $rf.Length, "127.0.0.1", $tunnelPort)
-    Write-Host "[TCP 4] Эмуляция игрового сервера ответила кадром TcpData."
-
-    # Реальный TCP-клиент должен получить ответ
-    $replyBuf = New-Object byte[] 1024
-    $gotLen = $tcpStream.Read($replyBuf, 0, $replyBuf.Length)
-    $gotTcp = [Text.Encoding]::UTF8.GetString($replyBuf, 0, $gotLen)
-    Write-Host "[TCP 5] TCP-клиент получил: '$gotTcp'"
-
-    if ($gotTcp -ne "PING-TCP") {
-        throw "TCP-клиент получил неверный ответ"
-    }
-    Write-Host "    OK: ответ доставлен TCP-клиенту через туннель."
-    $tcpClient.Close()
-    $tcpClient = $null
 
     Write-Host ""
-    Write-Host "ИТОГ: туннель между прокси-сервером и прокси-клиентом работает (UDP и TCP)."
+    Write-Host "ИТОГ: туннель работает (Auth, PING/PONG, UDP и TCP)."
 }
 catch {
     Write-Host ""
     Write-Host "ОШИБКА: $($_.Exception.Message)"
-    Write-Host "Смотрите лог процесса прокси-сервера выше."
+    if (Test-Path $serverLog) {
+        Write-Host "--- Лог прокси-сервера ---"
+        Get-Content $serverLog | Select-Object -Last 15
+    }
 }
 finally {
+    $ecdh.Dispose()
+    $identity.Dispose()
     if ($tcpClient) { $tcpClient.Close() }
-    $tunnel.Close()
-    $client.Close()
+    if ($tunnel) { $tunnel.Close() }
+    if ($player) { $player.Close() }
     Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $workDir -Recurse -Force -ErrorAction SilentlyContinue
 }

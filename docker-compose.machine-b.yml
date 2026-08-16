@@ -2,9 +2,14 @@
 # ПРИМЕР 2B: машина B — прокси-клиент + игровой сервер (реальный сценарий, 2 машины).
 # Запускать НА машине, где работает игровой UDP-сервер.
 #
+# Перед запуском:
+#   На машине B (один раз):  Proxify.Client --keygen ./deploy/
+#   client-public.pem передайте на машину A и зарегистрируйте его в конфиге
+#   сервера (см. docker-compose.machine-a.yml). Игровой порт, адрес игры и т.п.
+#   теперь задаются В КОНФИГЕ СЕРВЕРА, а не аргументами клиента.
+#
 # Запуск НА машине B:
 #   $env:MACHINE_A_IP = "1.2.3.4"        # публичный IP машины A
-#   $env:KEY = "my-secret"               # ключ (должен совпадать с машиной A)
 #   docker compose -f docker-compose.machine-b.yml up -d --build
 #
 # Порт 5600 — это порт туннеля на МАШИНЕ A; прокси-клиент сам устанавливает
@@ -29,22 +34,15 @@ services:
       target: client
     entrypoint: ["/app/machine-b-entrypoint.sh"]   # поднимает игровой сервер и клиента
     command:
-      # --server [прокси-сервер] --tunnel-port [порт туннеля сервера] --game-ip
-      #            --game-port --capture true/false --aliases true/false --key
+      # --server [машина A] --tunnel-port [порт туннеля A] --key [закрытый ключ]
       - "--server"
       - "${MACHINE_A_IP:-1.2.3.4}"   # IP машины A (без порта — туннель идёт на её порт туннеля)
       - "--tunnel-port"
       - "5600"                       # порт туннеля машины A
-      - "--game-ip"
-      - "127.0.0.1"             # игровой сервер в этом же контейнере
-      - "--game-port"
-      - "7777"
-      - "--capture"
-      - "true"                  # перехватывать ответы игрового сервера
-      - "--aliases"
-      - "true"                  # добавлять IP игроков на lo (ip addr add)
       - "--key"
-      - "${KEY:-example-secret-key}"
+      - "/app/client-private.pem"
+    volumes:
+      - "${CLIENT_KEY:-./deploy/client-private.pem}:/app/client-private.pem:ro"
     cap_add:
       - NET_RAW                 # raw-сокеты (впрыск пакетов, сниффер)
       - NET_ADMIN               # ip addr add/del на loopback

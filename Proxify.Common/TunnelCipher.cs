@@ -1,20 +1,17 @@
 using System.Security.Cryptography;
-using System.Text;
 
 namespace Proxify.Common;
 
 /// <summary>
-/// Шифрование туннельных кадров AES-GCM.
+/// Шифрование туннельных кадров AES-256-GCM.
 ///
-/// Ключ выводится из парольной фразы через PBKDF2-HMACSHA256 (100000 итераций).
-/// Каждый кадр шифруется отдельным случайным nonce (12 байт) и защищён
-/// аутентификационной меткой (16 байт): формат [nonce][tag][ciphertext].
+/// Ключ — сессионный (32 байта), выводится из ECDH при рукопожатии
+/// (см. <see cref="TunnelKeys.DeriveSessionKey"/>). Каждый кадр шифруется
+/// отдельным случайным nonce (12 байт) и защищён аутентификационной меткой
+/// (16 байт): формат [nonce][tag][ciphertext].
 /// </summary>
 public sealed class TunnelCipher
 {
-    private const int Iterations = 100_000;
-    private const int SaltSize = 16;
-
     public const int KeySize = 32;
     public const int NonceSize = 12;
     public const int TagSize = 16;
@@ -29,20 +26,6 @@ public sealed class TunnelCipher
             throw new ArgumentException($"Ключ должен быть {KeySize} байт.", nameof(key));
 
         _key = (byte[])key.Clone();
-    }
-
-    /// <summary>
-    /// Выводит ключ из парольной фразы (одинаковой у прокси-сервера и прокси-клиента).
-    /// </summary>
-    public static TunnelCipher FromPassphrase(string passphrase)
-    {
-        if (string.IsNullOrEmpty(passphrase))
-            throw new ArgumentException("Парольная фраза не должна быть пустой.", nameof(passphrase));
-
-        var passphraseBytes = Encoding.UTF8.GetBytes(passphrase);
-        var salt = SHA256.HashData(passphraseBytes).AsSpan(0, SaltSize).ToArray();
-        var key = Rfc2898DeriveBytes.Pbkdf2(passphraseBytes, salt, Iterations, HashAlgorithmName.SHA256, KeySize);
-        return new TunnelCipher(key);
     }
 
     /// <summary>

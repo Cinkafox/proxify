@@ -2,33 +2,45 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
+using System.Security.Cryptography;
 using System.Threading.Channels;
 using Proxify.Common;
 
 namespace Proxify.Client;
 
 /// <summary>
-/// Текущее состояние сессии проксирования на прокси-клиенте (машина B).
+/// Прокси-клиент (машина B).
 ///
-/// Владеет конфигурацией, туннельным сокетом, очередью инжекции и всеми
-/// текущими данными сессии: известные клиенты игры, активные IP (для
-/// loopback-алиасов), признак TCP-проксирования на сервере. Здесь же —
-/// рукопожатие (PING/PONG), циклы приёма/сердцебиения и очистка.
+/// Клиент знает только адрес прокси-сервера и свой закрытый ключ (PEM, PKCS#8).
+/// Параметры туннеля (игровой сервер, флаги capture/aliases/tcp) приходят от
+/// сервера в кадре AuthAck. Сессионный ключ выводится из ECDH при рукопожатии
+/// и обновляется при повторной авторизации (если сервер долго не отвечает).
 /// </summary>
 public sealed class ProxySession : IDisposable
 {
+    private static readonly TimeSpan AuthAttemptTimeout = TimeSpan.FromSeconds(3);
+    private static readonly TimeSpan ReauthTimeout = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan HeartbeatInterval = TimeSpan.FromSeconds(10);
+
+    private readonly ECDsa _identityKey;
+    private readonly object _authLock = new();
+
+    private ECDiffieHellman? _ephemeral;
+    private byte[]? _pendingNonce;
+    private TaskCompletionSource<bool>? _authTcs;
+    private long _lastPongTicks;
+    private LoopbackAliasManager? _aliases;
+    private RawInjector? _injector;
+    private TcpRelay? _tcpRelay;
+    private ReplySniffer? _sniffer;
+
     public IPEndPoint ProxyServer { get; }
-    public IPAddress GameIp { get; }
-    public ushort GamePort { get; }
-    public int TunnelPort { get; }
-    public bool CaptureReplies { get; }
-    public bool LoopbackAliases { get; }
-    public TunnelCipher Cipher { get; }
+    public TunnelCipher? Cipher { get; private set; }
+    public ClientConfig? Config { get; private set; }
 
     public TunnelStats Stats { get; } = new();
     public UdpClient Tunnel { get; }
     public ServerTcpStatus ServerTcp { get; } = new();
-    public LoopbackAliasManager Aliases { get; }
 
     /// <summary>Параллельная инжекция пакетов в игровой сервер.</summary>
     public AsyncWorkQueue InjectWork { get; }
@@ -39,112 +51,26 @@ public sealed class ProxySession : IDisposable
     /// <summary>Активные IP игроков (для loopback-алиасов и очистки по таймауту).</summary>
     public ConcurrentDictionary<IPAddress, DateTime> ActiveIps { get; } = new();
 
-    public ProxySession(
-        IPEndPoint proxyServer,
-        IPAddress gameIp,
-        ushort gamePort,
-        int tunnelPort,
-        bool captureReplies,
-        bool loopbackAliases,
-        TunnelCipher cipher)
+    public ProxySession(IPEndPoint proxyServer, ECDsa identityKey)
     {
         ProxyServer = proxyServer;
-        GameIp = gameIp;
-        GamePort = gamePort;
-        TunnelPort = tunnelPort;
-        CaptureReplies = captureReplies;
-        LoopbackAliases = loopbackAliases;
-        Cipher = cipher;
-
+        _identityKey = identityKey;
         Tunnel = new UdpClient();
-        Aliases = new LoopbackAliasManager(loopbackAliases);
+        Tunnel.Client.Bind(new IPEndPoint(IPAddress.Any, 0));
         InjectWork = new AsyncWorkQueue(Math.Clamp(Environment.ProcessorCount, 2, 8));
     }
 
     public void PrintBanner()
     {
+        var config = Config;
         Console.WriteLine("=== Прокси-клиент (RealIP) ===");
-        Console.WriteLine($"Прокси-сервер (машина A) : {ProxyServer} (порт туннеля)");
-        Console.WriteLine($"Игровой сервер (локально): {GameIp}:{GamePort}");
-        Console.WriteLine($"Порт туннеля            : {TunnelPort} (порт туннеля сервера)");
-        Console.WriteLine($"Перехват ответов       : {(CaptureReplies ? "вкл" : "выкл")}");
-        Console.WriteLine($"Loopback-алиасы        : {(LoopbackAliases ? "вкл" : "выкл")}");
-        Console.WriteLine("Шифрование туннеля      : вкл (AES-256-GCM)");
+        Console.WriteLine($"Прокси-сервер (машина A) : {ProxyServer}");
+        Console.WriteLine($"Игровой сервер (локально): {config!.GameIp}:{config.GamePort}");
+        Console.WriteLine($"Перехват ответов          : {(config.CaptureReplies ? "вкл" : "выкл")}");
+        Console.WriteLine($"Loopback-алиасы           : {(config.LoopbackAliases ? "вкл" : "выкл")}");
+        Console.WriteLine($"TCP-проксирование         : {(config.TcpEnabled ? "вкл" : "выкл")}");
+        Console.WriteLine("Шифрование туннеля        : ECDSA P-256 + ECDH P-256 + AES-256-GCM (сессионный ключ)");
         Console.WriteLine();
-    }
-
-    /// <summary>
-    /// Проверка связи с прокси-сервером: отправляет PING (3 попытки по 2 с) и ждёт PONG.
-    /// PING уходит с туннельного сокета — сервер по нему определяет адрес туннеля.
-    /// Работает даже при несовпадении ключа — сервер ответит «не разобранным» PING,
-    /// и клиент это увидит в логе сервера. При неудаче клиент всё равно продолжает работу.
-    /// Возвращает результат связи и флаг TCP-проксирования, который сервер передаёт в PONG.
-    /// </summary>
-    public async Task<(bool Ok, bool TcpEnabled)> HandshakeAsync()
-    {
-        Console.WriteLine("[диагностика] Проверка связи с прокси-сервером (PING/PONG)...");
-
-        var token = Guid.NewGuid().ToByteArray();
-        var ping = Frame.EncodeControl(Frame.TypePing, token, Cipher);
-
-        Tunnel.Client.ReceiveTimeout = 2000;
-
-        for (var attempt = 1; attempt <= 3; attempt++)
-        {
-            var sw = Stopwatch.StartNew();
-            try
-            {
-                await Tunnel.SendAsync(ping, ping.Length, ProxyServer);
-            }
-            catch (SocketException ex)
-            {
-                Console.WriteLine($"[диагностика] Попытка {attempt}/3: ошибка отправки: {ex.Message}");
-                continue;
-            }
-
-            var timeout = true;
-            var deadline = DateTime.UtcNow.AddSeconds(2);
-            while (DateTime.UtcNow < deadline)
-            {
-                byte[] resp;
-                try
-                {
-                    IPEndPoint? remote = null;
-                    resp = Tunnel.Receive(ref remote);
-                }
-                catch (SocketException ex) when (ex.SocketErrorCode == SocketError.TimedOut)
-                {
-                    break; // ждём до истечения таймаута, дальше — следующая попытка
-                }
-                catch (SocketException ex)
-                {
-                    Console.WriteLine($"[диагностика] Попытка {attempt}/3: ошибка приёма: {ex.Message}");
-                    timeout = false;
-                    break;
-                }
-
-                if (Frame.TryDecodePong(resp, resp.Length, Cipher, token.Length, out var pongToken, out var tcpFlag)
-                    && pongToken.AsSpan().SequenceEqual(token))
-                {
-                    sw.Stop();
-                    Console.WriteLine($"[диагностика] OK: сервер {ProxyServer} ответил на PING за {sw.ElapsedMilliseconds} мс.");
-                    Console.WriteLine($"[диагностика] TCP-проксирование на сервере: {(tcpFlag ? "включено" : "выключено")}.");
-                    return (true, tcpFlag);
-                }
-
-                Console.WriteLine("[диагностика] Получен несоответствующий PONG — жду дальше.");
-            }
-
-            if (timeout)
-                Console.WriteLine($"[диагностика] Попытка {attempt}/3: сервер не ответил за 2 с.");
-        }
-
-        Console.WriteLine("[!] Связь с прокси-сервером не установлена. Проверьте:");
-        Console.WriteLine("[!]   1) прокси-сервер запущен и слушает UDP-порт (по умолчанию 27015);");
-        Console.WriteLine("[!]   2) файрвол машины A пропускает UDP-трафик на порт туннеля;");
-        Console.WriteLine("[!]   3) ключ шифрования совпадает у сервера и клиента.");
-        Console.WriteLine("[!] Прокси-клиент продолжит работу и выведет [диагностика], как только получит первый кадр.");
-        return (false, false);
     }
 
     public async Task RunAsync()
@@ -156,26 +82,52 @@ public sealed class ProxySession : IDisposable
             cts.Cancel();
         };
 
-        var firstServerFrame = 0;
-
-        using var injector = new RawInjector(GameIp, GamePort);
-        using var tcpRelay = new TcpRelay(GameIp, GamePort, Tunnel, ProxyServer, Cipher, Stats, ServerTcp);
-        using var statsTimer = new Timer(_ => Stats.Print("прокси-клиент"), null, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(1));
-
-        ReplySniffer? sniffer = null;
+        // Циклы запускаются сразу: приём обрабатывает AuthAck рукопожатия, а сердцебиение
+        // начнёт слать PING только после появления сессионного ключа (Cipher != null).
         var tasks = new List<Task>
         {
-            Task.Run(() => ReceiveLoop(cts.Token, injector, tcpRelay, () => Interlocked.Exchange(ref firstServerFrame, 1) == 0)),
-            Task.Run(() => HeartbeatLoop(cts.Token))
+            Task.Run(() => ReceiveLoop(cts.Token)),
+            Task.Run(() => HeartbeatLoop(cts.Token)),
+            Task.Run(() => CleanupLoop(cts.Token)),
         };
 
-        if (CaptureReplies)
+        // 1. Авторизация: получаем сессионный ключ и конфиг от сервера.
+        Console.WriteLine("[auth] Авторизация на прокси-сервере...");
+        var authOk = await AuthenticateAsync(cts.Token);
+        if (!authOk)
         {
-            sniffer = new ReplySniffer(IPAddress.Loopback, GamePort, KnownClients, Tunnel, ProxyServer, Cipher, Stats, cts.Token);
-            tasks.Add(Task.Run(sniffer.Run));
+            Console.WriteLine("[!] Не удалось авторизоваться на прокси-сервере. Проверьте:");
+            Console.WriteLine("[!]   1) сервер запущен и слушает порт туннеля;");
+            Console.WriteLine("[!]   2) публичный ключ клиента (client-public.pem) зарегистрирован в конфиге сервера;");
+            Console.WriteLine("[!]   3) файрвол машины A пропускает UDP-трафик на порт туннеля.");
+            cts.Cancel();
+            try
+            {
+                await Task.WhenAll(tasks);
+            }
+            catch
+            {
+                // плановое завершение циклов
+            }
+            return;
+        }
+        PrintBanner();
+
+        var config = Config!;
+
+        // 2. Компоненты с известным конфигом (нужны адрес и порт игрового сервера).
+        var aliases = new LoopbackAliasManager(config.LoopbackAliases);
+        _aliases = aliases;
+        _injector = new RawInjector(config.GameIp, config.GamePort);
+        _tcpRelay = new TcpRelay(config.GameIp, config.GamePort, Tunnel, ProxyServer, () => Cipher, Stats, ServerTcp);
+
+        if (config.CaptureReplies)
+        {
+            _sniffer = new ReplySniffer(IPAddress.Loopback, config.GamePort, KnownClients, Tunnel, ProxyServer, () => Cipher, Stats, cts.Token);
+            tasks.Add(Task.Run(_sniffer.Run));
         }
 
-        tasks.Add(Task.Run(() => CleanupLoop(cts.Token)));
+        using var statsTimer = new Timer(_ => Stats.Print("прокси-клиент"), null, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(1));
 
         Console.WriteLine("Ожидание кадров от прокси-сервера...");
         Console.WriteLine("Нажмите Ctrl+C для остановки.");
@@ -194,16 +146,164 @@ public sealed class ProxySession : IDisposable
             Stats.Print("прокси-клиент");
             // Дожидаемся обработки оставшихся в очереди пакетов перед закрытием сокетов.
             await InjectWork.WaitForDrainAsync();
-            sniffer?.Dispose();
+            _sniffer?.Dispose();
+            _injector?.Dispose();
+            _tcpRelay?.Dispose();
+            aliases.Dispose();
             Console.WriteLine("Прокси-клиент остановлен.");
         }
     }
 
-    private async Task ReceiveLoop(
-        CancellationToken ct,
-        RawInjector injector,
-        TcpRelay tcpRelay,
-        Func<bool> reportFirstFrame)
+    /// <summary>
+    /// Отправляет кадр Auth и ждёт AuthAck (несколько попыток). Результат приходит
+    /// из цикла приёма через <see cref="_authTcs"/>. При успехе заполняются
+    /// <see cref="Cipher"/> и <see cref="Config"/>.
+    /// </summary>
+    private async Task<bool> AuthenticateAsync(CancellationToken ct)
+    {
+        for (var attempt = 1; attempt <= 3; attempt++)
+        {
+            var sw = Stopwatch.StartNew();
+            var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            lock (_authLock)
+            {
+                _authTcs = tcs;
+                _pendingNonce = RandomNumberGenerator.GetBytes(TunnelKeys.NonceSize);
+                _ephemeral?.Dispose();
+                _ephemeral = TunnelKeys.CreateEphemeral();
+                SendAuth();
+            }
+
+            Task completed;
+            try
+            {
+                completed = await Task.WhenAny(tcs.Task, Task.Delay(AuthAttemptTimeout, ct));
+            }
+            catch (OperationCanceledException)
+            {
+                return false;
+            }
+
+            if (ct.IsCancellationRequested)
+                return false;
+
+            if (completed == tcs.Task)
+            {
+                sw.Stop();
+                Console.WriteLine($"[auth] OK: авторизация за {sw.ElapsedMilliseconds} мс.");
+                return true;
+            }
+
+            Console.WriteLine($"[auth] Попытка {attempt}/3: сервер не ответил AuthAck за 3 с.");
+        }
+
+        lock (_authLock)
+        {
+            _authTcs = null;
+            _pendingNonce = null;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Отправляет кадр Auth с текущим эфемерным ключом и nonce.
+    /// </summary>
+    private void SendAuth()
+    {
+        if (_ephemeral == null || _pendingNonce == null)
+            return;
+
+        var (ephX, ephY) = TunnelKeys.ExportPoint(_ephemeral);
+        var payload = TunnelKeys.BuildAuthPayload(ephX, ephY, _pendingNonce);
+        var signature = TunnelKeys.Sign(_identityKey, payload);
+        var frame = Frame.EncodeAuth(TunnelKeys.AuthVersion, ephX, ephY, _pendingNonce, signature);
+
+        try
+        {
+            Tunnel.Send(frame, ProxyServer);
+        }
+        catch (SocketException ex)
+        {
+            Console.WriteLine($"[auth] Ошибка отправки Auth: {ex.Message}");
+        }
+        catch (ObjectDisposedException)
+        {
+            // сокет закрыт — выходим из рукопожатия
+        }
+    }
+
+    /// <summary>
+    /// Обработка кадра AuthAck: выводит сессионный ключ из ECDH, расшифровывает
+    /// «доказательство», проверяет echo nonce и сохраняет конфиг.
+    /// </summary>
+    private void HandleAuthAck(byte[] buffer, int length)
+    {
+        if (!Frame.TryDecodeAuthAck(buffer, length, out var sX, out var sY, out var wrappedProof))
+        {
+            Interlocked.Increment(ref Stats.BadFrames);
+            return;
+        }
+
+        byte[]? nonce;
+        ECDiffieHellman? ephemeral;
+        TaskCompletionSource<bool>? tcs;
+        lock (_authLock)
+        {
+            nonce = _pendingNonce;
+            ephemeral = _ephemeral;
+            tcs = _authTcs;
+        }
+
+        if (nonce == null || ephemeral == null || tcs == null)
+            return; // не ожидаем AuthAck в данный момент
+
+        TunnelCipher? cipher = null;
+        ClientConfig? config;
+        try
+        {
+            var sessionKey = TunnelKeys.DeriveSessionKey(ephemeral, sX, sY);
+            try
+            {
+                cipher = new TunnelCipher(sessionKey);
+                if (!ClientConfig.TryDecodeProof(nonce, cipher, wrappedProof, out config))
+                {
+                    Interlocked.Increment(ref Stats.BadFrames);
+                    Console.WriteLine("[auth] [!] AuthAck не прошёл проверку (неверный echo nonce или ключ).");
+                    return;
+                }
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(sessionKey);
+            }
+        }
+        catch (Exception ex)
+        {
+            Interlocked.Increment(ref Stats.BadFrames);
+            Console.WriteLine($"[auth] [!] Не удалось установить сессию: {ex.Message}");
+            return;
+        }
+
+        Cipher = cipher;
+        Config = config;
+        Interlocked.Exchange(ref _lastPongTicks, DateTime.UtcNow.Ticks);
+
+        lock (_authLock)
+        {
+            _authTcs = null;
+            _pendingNonce = null;
+            _ephemeral?.Dispose();
+            _ephemeral = null;
+        }
+
+        tcs.TrySetResult(true);
+        Console.WriteLine($"[auth] Получена конфигурация от сервера: игра {config.GameIp}:{config.GamePort}, " +
+                          $"capture={(config.CaptureReplies ? "вкл" : "выкл")}, aliases={(config.LoopbackAliases ? "вкл" : "выкл")}, " +
+                          $"tcp={(config.TcpEnabled ? "вкл" : "выкл")}.");
+    }
+
+    private async Task ReceiveLoop(CancellationToken ct)
     {
         while (!ct.IsCancellationRequested)
         {
@@ -229,15 +329,28 @@ public sealed class ProxySession : IDisposable
             var frameType = Frame.PeekFrameType(result.Buffer, result.Buffer.Length);
             if (frameType is Frame.TypeTcpOpen or Frame.TypeTcpData or Frame.TypeTcpClose)
             {
-                tcpRelay.OnFrame(result.Buffer, result.Buffer.Length);
+                _tcpRelay?.OnFrame(result.Buffer, result.Buffer.Length);
                 continue;
             }
+
+            if (frameType == Frame.TypeAuthAck)
+            {
+                HandleAuthAck(result.Buffer, result.Buffer.Length);
+                continue;
+            }
+
+            var cipher = Cipher;
+            if (cipher == null)
+                continue;
 
             if (frameType == Frame.TypePong)
             {
                 // Сервер каждым PONG сообщает, включено ли у него TCP-проксирование.
-                if (Frame.TryDecodePong(result.Buffer, result.Buffer.Length, Cipher, 16, out _, out var tcpFlag))
+                if (Frame.TryDecodePong(result.Buffer, result.Buffer.Length, cipher, 16, out _, out var tcpFlag))
+                {
+                    Interlocked.Exchange(ref _lastPongTicks, DateTime.UtcNow.Ticks);
                     ServerTcp.Set(tcpFlag);
+                }
                 continue;
             }
             if (frameType == Frame.TypePing)
@@ -248,12 +361,12 @@ public sealed class ProxySession : IDisposable
 
             if (frameType == Frame.TypeData && Cipher != null)
             {
-                Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Получен незашифрованный кадр, но шифрование включено. Проверьте ключ у прокси-сервера.");
+                Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Получен незашифрованный кадр, но шифрование включено. Проверьте конфиг у прокси-сервера.");
                 Interlocked.Increment(ref Stats.BadFrames);
                 continue;
             }
 
-            if (!Frame.TryDecodeData(result.Buffer, result.Buffer.Length, Cipher, out var clientIp, out var clientPort, out var payload))
+            if (!Frame.TryDecodeData(result.Buffer, result.Buffer.Length, cipher, out var clientIp, out var clientPort, out var payload))
             {
                 Interlocked.Increment(ref Stats.BadFrames);
                 Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Не удалось разобрать кадр ({result.Buffer.Length} байт).");
@@ -262,16 +375,17 @@ public sealed class ProxySession : IDisposable
 
             Interlocked.Increment(ref Stats.PacketsIn);
 
+            var injector = _injector;
+            if (injector == null)
+                continue;
+
             // Инжекция и обновление словарей выполняются воркером параллельно,
             // чтобы цикл приёма не ждал отправки «сырых» пакетов.
             try
             {
                 await InjectWork.EnqueueAsync(() =>
                 {
-                    if (reportFirstFrame())
-                        Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [диагностика] Получен первый кадр туннеля от прокси-сервера — канал работает.");
-
-                    Aliases.Add(clientIp);
+                    _aliases?.Add(clientIp);
                     KnownClients[new IPEndPoint(clientIp, clientPort)] = DateTime.UtcNow;
                     ActiveIps[clientIp] = DateTime.UtcNow;
 
@@ -288,19 +402,22 @@ public sealed class ProxySession : IDisposable
     }
 
     /// <summary>
-    /// Сердцебиение: раз в 10 секунд отправляет прокси-серверу PING с туннельного
-    /// сокета. Сервер по нему определяет/обновляет адрес туннеля — связь восстанавливается
-    /// сама после перезапуска сервера, смены порта после NAT или неудачного стартового PING.
+    /// Сердцебиение: раз в 10 секунд отправляет прокси-серверу PING. Сервер по нему
+    /// держит сессию живой. Если PONG давно не было (30 с) — сессия протухла:
+    /// выполняем повторную авторизацию (новый Auth/AuthAck и сессионный ключ).
     /// </summary>
     private async Task HeartbeatLoop(CancellationToken ct)
     {
-        var ping = Frame.EncodeControl(Frame.TypePing, Guid.NewGuid().ToByteArray(), Cipher);
-
         while (!ct.IsCancellationRequested)
         {
             try
             {
-                await Tunnel.SendAsync(ping, ping.Length, ProxyServer);
+                var cipher = Cipher;
+                if (cipher != null)
+                {
+                    var ping = Frame.EncodeControl(Frame.TypePing, Guid.NewGuid().ToByteArray(), cipher);
+                    await Tunnel.SendAsync(ping, ping.Length, ProxyServer);
+                }
             }
             catch (SocketException)
             {
@@ -311,9 +428,17 @@ public sealed class ProxySession : IDisposable
                 break;
             }
 
+            var lastPong = Interlocked.Read(ref _lastPongTicks);
+            if (Cipher != null && DateTime.UtcNow.Ticks - lastPong > ReauthTimeout.Ticks)
+            {
+                Console.WriteLine("[auth] Сессия протухла (нет ответа сервера) — повторная авторизация...");
+                if (await AuthenticateAsync(ct))
+                    Console.WriteLine("[auth] Сессия восстановлена.");
+            }
+
             try
             {
-                await Task.Delay(TimeSpan.FromSeconds(10), ct);
+                await Task.Delay(HeartbeatInterval, ct);
             }
             catch (OperationCanceledException)
             {
@@ -342,7 +467,7 @@ public sealed class ProxySession : IDisposable
             foreach (var entry in ActiveIps)
             {
                 if (now - entry.Value > idleTimeout && ActiveIps.TryRemove(entry.Key, out _))
-                    Aliases.Remove(entry.Key);
+                    _aliases?.Remove(entry.Key);
             }
         }
     }
@@ -350,7 +475,8 @@ public sealed class ProxySession : IDisposable
     public void Dispose()
     {
         InjectWork.Dispose();
-        Aliases.Dispose();
+        _aliases?.Dispose();
         Tunnel.Dispose();
+        _identityKey.Dispose();
     }
 }

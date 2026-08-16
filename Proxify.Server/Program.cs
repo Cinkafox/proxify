@@ -1,17 +1,13 @@
-﻿using System.Net;
-using System.Net.Sockets;
-using System.Text;
+﻿using System.Text;
 using Proxify.Common;
 using Proxify.Server;
 
 Console.OutputEncoding = Encoding.UTF8;
 
 var cli = new ArgParser("Proxify.Server")
-    .Add("port", "UDP-порт, на который подключаются клиенты игры", required: true, shortName: 'p')
-    .Add("tunnel-port", "UDP-порт туннеля, на который прокси-клиент (машина B) шлёт кадры", required: true, shortName: 't')
-    .Add("key", "Ключ шифрования (одинаковый у сервера и клиента). Обязателен — кадры всегда шифруются AES-256-GCM", required: true, shortName: 'k')
-    .Add("tcp", "Проксировать TCP-трафик клиентов на игровой сервер (true/false). TCP-порт совпадает с --port", defaultValue: "false")
-    .Add("client-ip", "Разрешить только этому IPv4 выступать прокси-клиентом (машина B). Без указания — сервер принимает первого аутентифицированного клиента и фиксирует его адрес", shortName: 'c');
+    .Add("config", "Путь к JSON-конфигу с клиентами (порт, публичный ключ, игровые параметры)", shortName: 'c')
+    .Add("tunnel-port", "UDP-порт туннеля, на который прокси-клиенты (машина B) шлют кадры", shortName: 't')
+    .Add("configgen", "Сгенерировать шаблон server.json из client-public.pem в указанном каталоге и выйти", shortName: 'g');
 
 if (!cli.TryParse(args))
 {
@@ -22,11 +18,18 @@ if (!cli.TryParse(args))
 if (cli.HelpRequested)
     return 0;
 
-if (!NetUtils.TryParsePort(cli.Get("port"), out var listenPort))
+// --- Режим генерации конфига ---
+var configgenDir = cli.Get("configgen");
+if (!string.IsNullOrWhiteSpace(configgenDir))
 {
-    Console.WriteLine($"[ошибка конфигурации] '--port {cli.Get("port")}' не является допустимым (ожидается число от 1 до 65535).");
-    cli.PrintUsage();
-    return 1;
+    if (!ServerConfig.TryGenerateTemplate(configgenDir, out var path, out var genError))
+    {
+        Console.WriteLine($"[ошибка конфигурации] {genError}");
+        return 1;
+    }
+    Console.WriteLine($"Сгенерирован шаблон конфига: {path}");
+    Console.WriteLine("Отредактируйте порт/игровые параметры при необходимости и запустите сервер с --config.");
+    return 0;
 }
 
 if (!NetUtils.TryParsePort(cli.Get("tunnel-port"), out var tunnelPort))
@@ -35,44 +38,29 @@ if (!NetUtils.TryParsePort(cli.Get("tunnel-port"), out var tunnelPort))
     cli.PrintUsage();
     return 1;
 }
-
-if (tunnelPort == listenPort)
+var configPath = cli.Get("config");
+if (string.IsNullOrWhiteSpace(configPath))
 {
-    Console.WriteLine("[ошибка конфигурации] '--tunnel-port' не может совпадать с '--port'.");
+    Console.WriteLine("[ошибка конфигурации] Не задан '--config'. Используйте --configgen, чтобы создать шаблон, или укажите путь к конфигу.");
     cli.PrintUsage();
     return 1;
 }
-
-var key = cli.Get("key")!;
-if (string.IsNullOrWhiteSpace(key))
+if (!ServerConfig.TryLoad(configPath, out var clients, out var configError))
 {
-    Console.WriteLine("[ошибка конфигурации] '--key' не может быть пустым.");
-    cli.PrintUsage();
+    Console.WriteLine($"[ошибка конфигурации] {configError}");
     return 1;
 }
 
-if (!bool.TryParse(cli.Get("tcp"), out var tcpEnabled))
+foreach (var client in clients)
 {
-    Console.WriteLine($"[ошибка конфигурации] '--tcp {cli.Get("tcp")}' должен быть true или false.");
-    cli.PrintUsage();
-    return 1;
-}
-
-IPAddress? allowedClientIp = null;
-var clientIpText = cli.Get("client-ip");
-if (!string.IsNullOrWhiteSpace(clientIpText))
-{
-    if (!IPAddress.TryParse(clientIpText, out allowedClientIp) || allowedClientIp.AddressFamily != AddressFamily.InterNetwork)
+    if (tunnelPort == client.Port || (client.TcpEnabled && tunnelPort == client.TcpPort))
     {
-        Console.WriteLine($"[ошибка конфигурации] '--client-ip {clientIpText}' не является IPv4-адресом.");
-        cli.PrintUsage();
+        Console.WriteLine($"[ошибка конфигурации] '--tunnel-port {tunnelPort}' совпадает с портом клиента '{client.DisplayName()}' — конфликт.");
         return 1;
     }
 }
 
-var cipher = TunnelCipher.FromPassphrase(key);
-
-using var session = new ProxySession(listenPort, tunnelPort, tcpEnabled, allowedClientIp, cipher);
+using var session = new ProxySession(clients, tunnelPort);
 using var statsTimer = new Timer(_ => session.Stats.Print("прокси-сервер"), null, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(1));
 
 session.PrintBanner();
@@ -87,3 +75,9 @@ catch (Exception ex)
 }
 
 return 0;
+
+internal static class ConfigExtensions
+{
+    public static string DisplayName(this ClientConfig config)
+        => string.IsNullOrWhiteSpace(config.Name) ? "(без имени)" : config.Name;
+}
