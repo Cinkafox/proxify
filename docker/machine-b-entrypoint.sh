@@ -10,4 +10,4 @@ python3 /app/gamesrv.py &
 sleep 1
 
 # Аргументы прокси-клиента передаются аргументами контейнера (см. docker-compose).
-exec dotnet /app/Proxy.Client.dll "$@"
+exec dotnet /app/Proxify.Client.dll "$@"

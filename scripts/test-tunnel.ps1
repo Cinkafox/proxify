@@ -144,15 +144,15 @@ function Build-ControlFrame {
 
 # --- Основной поток теста ---
 
-# Тест туннеля между Proxy.Server и (эмуляцией) Proxy.Client.
-# Запускает Proxy.Server, играет роль реального клиента и роль туннеля прокси-клиента.
+# Тест туннеля между Proxify.Server и (эмуляцией) Proxify.Client.
+# Запускает Proxify.Server, играет роль реального клиента и роль туннеля прокси-клиента.
 # Проверяет: клиент -> сервер -> кадр прокси-клиенту -> ответ серверу -> клиенту.
 # Шифрование AES-256-GCM обязательно (сервер не запускается без ключа).
 # Туннель теперь живёт на сервере: клиент шлёт кадры на его --tunnel-port,
 # а сам слушает эфемерный порт (как реальный прокси-клиент).
 
 $root = Split-Path -Parent $PSScriptRoot
-$serverDll = Join-Path $root "Proxy.Server\bin\Release\net8.0\Proxy.Server.dll"
+$serverDll = Join-Path $root "Proxify.Server\bin\Release\net8.0\Proxify.Server.dll"
 
 if (-not (Test-Path $serverDll)) {
     throw "Не найдена сборка: $serverDll. Сначала выполните: dotnet build Proxify.slnx -c Release"

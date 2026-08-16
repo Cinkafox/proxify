@@ -23,10 +23,10 @@
 
 | Проект          | Назначение |
 |-----------------|------------|
-| `Proxy.Server`  | Публичный UDP-порт для клиентов игры + туннель к прокси-клиенту. |
-| `Proxy.Client`  | Приём кадров туннеля, впрыск пакетов в локальный игровой сервер с настоящим IP, перехват ответов. |
-| `Proxy.Common`  | Общий код: формат кадра, построение/разбор IPv4+UDP пакетов, контрольные суммы, loopback-алиасы. |
-| `Proxy.SelfTest`| Самопроверка подмены IP и перехвата ответов (нужны права администратора). |
+| `Proxify.Server`  | Публичный UDP-порт для клиентов игры + туннель к прокси-клиенту. |
+| `Proxify.Client`  | Приём кадров туннеля, впрыск пакетов в локальный игровой сервер с настоящим IP, перехват ответов. |
+| `Proxify.Common`  | Общий код: формат кадра, построение/разбор IPv4+UDP пакетов, контрольные суммы, loopback-алиасы. |
+| `Proxify.SelfTest`| Самопроверка подмены IP и перехвата ответов (нужны права администратора). |
 
 ## Как это работает
 
@@ -61,7 +61,7 @@
 
 - Windows + .NET SDK 8 (или новее) для сборки.
 - **Права администратора** (Windows) / **root или `CAP_NET_RAW` + `CAP_NET_ADMIN`**
-  (Linux) для запуска `Proxy.Client` (RawSocket, перехват ответов, изменение
+  (Linux) для запуска `Proxify.Client` (RawSocket, перехват ответов, изменение
   loopback-интерфейса). Прокси-сервер прав не требует.
 - **Ключ шифрования (`--key`) обязателен** у сервера и прокси-клиента: кадры
   туннеля всегда шифруются AES-256-GCM, сервер без ключа не запускается.
@@ -90,8 +90,8 @@ dotnet build Proxify.slnx -c Release
 ### Машина A — прокси-сервер
 
 ```powershell
-# Proxy.Server --port <портИгроков> --tunnel-port <портТуннеля> --key <ключ>
-Proxy.Server.exe --port 27015 --tunnel-port 5600 --key my-secret
+# Proxify.Server --port <портИгроков> --tunnel-port <портТуннеля> --key <ключ>
+Proxify.Server.exe --port 27015 --tunnel-port 5600 --key my-secret
 ```
 
 Обязательные: `--port` (UDP-порт, на который подключаются игроки),
@@ -106,10 +106,10 @@ Proxy.Server.exe --port 27015 --tunnel-port 5600 --key my-secret
 ### Машина B — прокси-клиент (запускать ОТ АДМИНИСТРАТОРА)
 
 ```powershell
-# Proxy.Client --server <проксиСервер> --tunnel-port <портТуннеляСервера>
+# Proxify.Client --server <проксиСервер> --tunnel-port <портТуннеляСервера>
 #              [--game-ip 127.0.0.1] [--game-port 7777]
 #              [--capture true] [--aliases true] --key <ключ>
-Proxy.Client.exe --server 1.2.3.4 --tunnel-port 5600 --key my-secret
+Proxify.Client.exe --server 1.2.3.4 --tunnel-port 5600 --key my-secret
 ```
 
 Обязательные: `--server` (IP или имя хоста прокси-сервера, машина A — без порта),
@@ -160,11 +160,11 @@ loopback-алиасы).
 Запуск идентичен, но:
 
 ```bash
-sudo dotnet Proxy.Client.dll --server 1.2.3.4 --tunnel-port 5600 --key my-secret
-dotnet Proxy.Server.dll --port 27015 --tunnel-port 5600 --key my-secret
+sudo dotnet Proxify.Client.dll --server 1.2.3.4 --tunnel-port 5600 --key my-secret
+dotnet Proxify.Server.dll --port 27015 --tunnel-port 5600 --key my-secret
 ```
 
-- `Proxy.Client` запускать под `sudo` (нужны `CAP_NET_RAW` для raw-сокета и
+- `Proxify.Client` запускать под `sudo` (нужны `CAP_NET_RAW` для raw-сокета и
   `CAP_NET_ADMIN` для `ip addr add/del`).
 - Подмена IP работает без алиасов; алиасы (`ip addr add <ip>/32 dev lo`) добавляются
   автоматически, чтобы ответы сервера возвращались через loopback в сниффер.
@@ -178,7 +178,7 @@ dotnet Proxy.Server.dll --port 27015 --tunnel-port 5600 --key my-secret
 pwsh scripts\test-tunnel.ps1 -Key "my-secret-key"
 
 # Подмена IP + перехват ответов (ОТ АДМИНИСТРАТОРА)
-dotnet run --project Proxy.SelfTest -c Release
+dotnet run --project Proxify.SelfTest -c Release
 ```
 
 ## Docker (docker-compose)
@@ -194,7 +194,7 @@ dotnet run --project Proxy.SelfTest -c Release
 Образ `client` собирается с игровым UDP-сервером-эхом
 (`docker/gamesrv.py`, порт `7777`) — замените его своим сервером, но
 запускайте его **в том же контейнере/сетевом пространстве**, что и
-`Proxy.Client` (см. `docker/machine-b-entrypoint.sh`), иначе ответы сервера
+`Proxify.Client` (см. `docker/machine-b-entrypoint.sh`), иначе ответы сервера
 не попадут в перехватчик на loopback.
 
 Ключ шифрования задаётся переменной окружения `KEY` (или `.env`-файлом):
@@ -289,7 +289,7 @@ AES-256-GCM (встроенный .NET `System.Security.Cryptography.AesGcm`).
 ## Структура проекта
 
 ```
-Proxy.Common/
+Proxify.Common/
   Frame.cs              кодирование/декодирование кадров туннеля
   TunnelCipher.cs       AES-256-GCM + PBKDF2 для шифрования кадров
   Packets.cs            сборка и разбор IPv4+UDP пакетов
@@ -299,11 +299,11 @@ Proxy.Common/
   NetUtils.cs              вспомогательные утилиты (разбор ip:port, портов, флагов)
   ArgParser.cs             разбор аргументов --имя значение (обязательные/дефолты/--help)
   TunnelStats.cs           счётчики трафика и строка [stats]
-Proxy.Server/Program.cs     прокси-сервер (реле игроков и туннеля)
-Proxy.Client/Program.cs     конфигурация и запуск прокси-клиента
-Proxy.Client/RawInjector.cs  RawSocket-впрыск с настоящим IP (IP_HDRINCL)
-Proxy.Client/ReplySniffer.cs перехват ответов и возврат в туннель
-Proxy.SelfTest/Program.cs    самопроверка
+Proxify.Server/Program.cs     прокси-сервер (реле игроков и туннеля)
+Proxify.Client/Program.cs     конфигурация и запуск прокси-клиента
+Proxify.Client/RawInjector.cs  RawSocket-впрыск с настоящим IP (IP_HDRINCL)
+Proxify.Client/ReplySniffer.cs перехват ответов и возврат в туннель
+Proxify.SelfTest/Program.cs    самопроверка
 scripts/test-tunnel.ps1      интеграционный тест туннеля
 Dockerfile                   трёхстадийная сборка образов server/client
 docker/gamesrv.py            игровой UDP-сервер-эхо для примера (порт 7777)
