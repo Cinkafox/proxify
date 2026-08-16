@@ -195,7 +195,40 @@ $cipherKey = Get-CipherKey $Key
 Write-Host "=== Тест туннеля (AES-256-GCM, ключ обязателен) ==="
 Write-Host ""
 
-$serverArgs = @($serverDll, "--port", "$listenPort", "--tunnel-port", "$tunnelPort", "--tcp", "true", "--key", $Key)
+# 0a. Негативный тест защиты от чужого клиента: сервер разрешает прокси-клиента
+# только с адреса 203.0.113.9, а PING уходит с 127.0.0.1 — сервер должен отвергнуть его.
+Write-Host "[0a] Проверка защиты от другого клиента (--client-ip 203.0.113.9)..."
+$negPort = 27025
+$negTunnelPort = 5601
+$negProc = Start-Process dotnet -ArgumentList @($serverDll, "--port", "$negPort", "--tunnel-port", "$negTunnelPort", "--client-ip", "203.0.113.9", "--key", $Key) -PassThru -NoNewWindow
+Start-Sleep -Milliseconds 1200
+
+$negTunnel = New-Object System.Net.Sockets.UdpClient
+$negToken = New-Object byte[] 16
+$rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+try { $rng.GetBytes($negToken) } finally { $rng.Dispose() }
+$negPing = Build-ControlFrame -Type 3 -Body $negToken -Key $cipherKey
+[void]$negTunnel.Send($negPing, $negPing.Length, "127.0.0.1", $negTunnelPort)
+$negTunnel.Client.ReceiveTimeout = 1200
+$negEp = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
+$rejected = $true
+try {
+    [void]$negTunnel.Receive([ref]$negEp)
+    $rejected = $false
+} catch [System.Net.Sockets.SocketException] {
+    # таймаут — сервер не ответил, чужой клиент отвергнут
+}
+$negTunnel.Dispose()
+Stop-Process -Id $negProc.Id -Force
+
+if (-not $rejected) {
+    throw "Сервер ответил на PING чужого клиента (защита --client-ip не сработала)"
+}
+Write-Host "    OK: сервер отверг чужого клиента (PING без ответа)."
+Write-Host ""
+
+# 0b. Основной сервер разрешает прокси-клиента с 127.0.0.1 (наш эмулируемый клиент).
+$serverArgs = @($serverDll, "--port", "$listenPort", "--tunnel-port", "$tunnelPort", "--tcp", "true", "--client-ip", "127.0.0.1", "--key", $Key)
 
 $proc = Start-Process dotnet -ArgumentList $serverArgs -PassThru -NoNewWindow
 Start-Sleep -Milliseconds 1500
