@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Threading.Channels;
 using Proxify.Client;
 using Proxify.Common;
 
@@ -231,11 +232,16 @@ static async Task RunAsync(
     using var tcpRelay = new TcpRelay(gameIp, gamePort, tunnel, proxyServer, cipher, stats, serverTcp);
     using var statsTimer = new Timer(_ => stats.Print("прокси-клиент"), null, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(1));
 
+    // Параллельная инжекция пакетов в игровой сервер: цикл приёма туннеля не ждёт
+    // отправки «сырых» пакетов, а ставит их в очередь воркеров.
+    var workerCount = Math.Clamp(Environment.ProcessorCount, 2, 8);
+    using var injectWork = new AsyncWorkQueue(workerCount);
+
     ReplySniffer? sniffer = null;
     var tasks = new List<Task>
     {
         Task.Run(() => ReceiveLoop(tunnel, aliases, injector, knownClients, activeIps, cipher, stats,
-            () => Interlocked.Exchange(ref firstServerFrame, 1) == 0, cts.Token, tcpRelay, serverTcp)),
+            () => Interlocked.Exchange(ref firstServerFrame, 1) == 0, cts.Token, tcpRelay, serverTcp, injectWork)),
         Task.Run(() => HeartbeatLoop(tunnel, proxyServer, cipher, cts.Token))
     };
 
@@ -262,6 +268,8 @@ static async Task RunAsync(
     finally
     {
         stats.Print("прокси-клиент");
+        // Дожидаемся обработки оставшихся в очереди пакетов перед закрытием сокетов.
+        await injectWork.WaitForDrainAsync();
         sniffer?.Dispose();
         aliases.Dispose();
         Console.WriteLine("Прокси-клиент остановлен.");
@@ -312,7 +320,8 @@ static async Task ReceiveLoop(
     Func<bool> reportFirstFrame,
     CancellationToken ct,
     TcpRelay tcpRelay,
-    ServerTcpStatus serverTcp)
+    ServerTcpStatus serverTcp,
+    AsyncWorkQueue injectWork)
 {
     while (!ct.IsCancellationRequested)
     {
@@ -370,15 +379,29 @@ static async Task ReceiveLoop(
         }
 
         Interlocked.Increment(ref stats.PacketsIn);
-        if (reportFirstFrame())
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [диагностика] Получен первый кадр туннеля от прокси-сервера — канал работает.");
 
-        aliases.Add(clientIp);
-        knownClients[new IPEndPoint(clientIp, clientPort)] = DateTime.UtcNow;
-        activeIps[clientIp] = DateTime.UtcNow;
+        // Инжекция и обновление словарей выполняются воркером параллельно,
+        // чтобы цикл приёма не ждал отправки «сырых» пакетов.
+        try
+        {
+            await injectWork.EnqueueAsync(() =>
+            {
+                if (reportFirstFrame())
+                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [диагностика] Получен первый кадр туннеля от прокси-сервера — канал работает.");
 
-        injector.Inject(clientIp, clientPort, payload);
-        Interlocked.Increment(ref stats.Injected);
+                aliases.Add(clientIp);
+                knownClients[new IPEndPoint(clientIp, clientPort)] = DateTime.UtcNow;
+                activeIps[clientIp] = DateTime.UtcNow;
+
+                injector.Inject(clientIp, clientPort, payload);
+                Interlocked.Increment(ref stats.Injected);
+                return Task.CompletedTask;
+            });
+        }
+        catch (ChannelClosedException)
+        {
+            break;
+        }
     }
 }
 

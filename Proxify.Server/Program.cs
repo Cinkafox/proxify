@@ -2,6 +2,7 @@
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Threading.Channels;
 using Proxify.Common;
 
 Console.OutputEncoding = Encoding.UTF8;
@@ -86,6 +87,14 @@ using var tunnel = new UdpClient(new IPEndPoint(IPAddress.Any, tunnelPort));
 using var tcpListener = tcpEnabled ? new TcpListener(IPAddress.Any, listenPort) : null;
 using var statsTimer = new Timer(_ => stats.Print("прокси-сервер"), null, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(1));
 
+// Параллельная обработка пакетов: циклы приёма только получают дейтаграммы и
+// ставят их в очередь, а воркеры разбирают и отправляют их независимо. Это
+// разгружает циклы приёма (медленная отправка не стопорит приём) и позволяет
+// обрабатывать пакеты разных игроков/кадры туннеля одновременно.
+var workerCount = Math.Clamp(Environment.ProcessorCount, 2, 8);
+using var playerWork = new AsyncWorkQueue(workerCount); // игроки -> прокси-клиент
+using var tunnelWork = new AsyncWorkQueue(workerCount); // прокси-клиент -> игроки
+
 // Текущий адрес прокси-клиента. Обучается динамически: сервер запоминает источник
 // первого валидного кадра туннеля и обновляет его при изменении (перезапуск клиента,
 // смена порта после NAT). Пока адрес не определён, пакеты игроков отбрасываются.
@@ -96,6 +105,10 @@ long lastNoClientLogTicks = 0;
 // TCP-соединения реальных клиентов: connId -> сокет. connId присваивается сервером
 // при принятии TCP-подключения и используется в кадрах TcpOpen/TcpData/TcpClose.
 var tcpClients = new ConcurrentDictionary<uint, TcpClient>();
+// Сериализация записи в конкретное TCP-соединение: TcpData для одного connId могут
+// обрабатываться разными воркерами параллельно, и без блокировки байты
+// перемешивались бы в потоке.
+var tcpWriteLocks = new ConcurrentDictionary<uint, SemaphoreSlim>();
 long nextTcpConnId = 0;
 
 try
@@ -221,6 +234,9 @@ void CloseTcpLocally(uint connId)
             // уже закрыт
         }
     }
+
+    if (tcpWriteLocks.TryRemove(connId, out var writeLock))
+        writeLock.Dispose();
 }
 
 async Task CloseTcpWithRemoteAsync(uint connId)
@@ -286,7 +302,15 @@ async Task PlayerLoop()
             break;
         }
 
-        await HandlePlayerPacket(result.RemoteEndPoint, result.Buffer);
+        // Пакет обрабатывается воркером параллельно с другими пакетами.
+        try
+        {
+            await playerWork.EnqueueAsync(() => HandlePlayerPacket(result.RemoteEndPoint, result.Buffer));
+        }
+        catch (ChannelClosedException)
+        {
+            break;
+        }
     }
 }
 
@@ -309,7 +333,15 @@ async Task TunnelLoop()
             break;
         }
 
-        await HandleTunnelFrame(result.RemoteEndPoint, result.Buffer);
+        // Кадр обрабатывается воркером параллельно с другими кадрами.
+        try
+        {
+            await tunnelWork.EnqueueAsync(() => HandleTunnelFrame(result.RemoteEndPoint, result.Buffer));
+        }
+        catch (ChannelClosedException)
+        {
+            break;
+        }
     }
 }
 
@@ -378,10 +410,19 @@ async Task HandleTunnelFrame(IPEndPoint from, byte[] data)
                 LearnProxyClient(from);
                 if (tcpClients.TryGetValue(connId, out var tcpClient))
                 {
+                    var writeLock = tcpWriteLocks.GetOrAdd(connId, _ => new SemaphoreSlim(1, 1));
                     try
                     {
-                        await tcpClient.GetStream().WriteAsync(payload);
-                        Interlocked.Increment(ref stats.RepliesRelayed);
+                        await writeLock.WaitAsync();
+                        try
+                        {
+                            await tcpClient.GetStream().WriteAsync(payload);
+                            Interlocked.Increment(ref stats.RepliesRelayed);
+                        }
+                        finally
+                        {
+                            writeLock.Release();
+                        }
                     }
                     catch (Exception ex)
                     {
