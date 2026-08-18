@@ -51,12 +51,12 @@ public sealed class ProxySession : IDisposable
     /// <summary>Активные IP игроков (для loopback-алиасов и очистки по таймауту).</summary>
     public ConcurrentDictionary<IPAddress, DateTime> ActiveIps { get; } = new();
 
-    public ProxySession(IPEndPoint proxyServer, ECDsa identityKey)
+    public ProxySession(IPEndPoint proxyServer, ECDsa identityKey, int? localPort = null)
     {
         ProxyServer = proxyServer;
         _identityKey = identityKey;
         Tunnel = new UdpClient();
-        Tunnel.Client.Bind(new IPEndPoint(IPAddress.Any, 0));
+        Tunnel.Client.Bind(new IPEndPoint(IPAddress.Any, localPort ?? 0));
         InjectWork = new AsyncWorkQueue(Math.Clamp(Environment.ProcessorCount, 2, 8));
     }
 

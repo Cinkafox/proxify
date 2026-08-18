@@ -9,6 +9,7 @@ Console.OutputEncoding = Encoding.UTF8;
 var cli = new ArgParser("Proxify.Client")
     .Add("server", "Адрес прокси-сервера (машина A): host или host:порт туннеля. Если порт не указан, используется --tunnel-port", shortName: 's')
     .Add("tunnel-port", "UDP-порт туннеля ПРОКСИ-СЕРВЕРА (машины A), если он не указан в --server", shortName: 't')
+    .Add("local-port", "Локальный UDP-порт туннеля клиента. Если не задан, ОС выберет свободный (port 0). Полезно для файрволов.", shortName: 'l')
     .Add("key", "Путь к закрытому ключу клиента (PEM, PKCS#8). Создаётся командой --keygen", shortName: 'k')
     .Add("keygen", "Сгенерировать пару ключей в указанном каталоге (client-private.pem, client-public.pem) и выйти", shortName: 'g');
 
@@ -85,7 +86,19 @@ catch (Exception ex)
     return 1;
 }
 
-using var session = new ProxySession(proxyServer, identityKey);
+int? localPort = null;
+var localPortText = cli.Get("local-port");
+if (!string.IsNullOrWhiteSpace(localPortText))
+{
+    if (!NetUtils.TryParsePort(localPortText, out var lp))
+    {
+        Console.WriteLine($"[ошибка конфигурации] Неверный локальный порт '{localPortText}'.");
+        return 1;
+    }
+    localPort = lp;
+}
+
+using var session = new ProxySession(proxyServer, identityKey, localPort);
 
 try
 {
