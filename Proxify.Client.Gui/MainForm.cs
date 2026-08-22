@@ -86,6 +86,9 @@ public sealed class MainForm : Form
         Console.SetOut(_logWriter);
         _logWriter.TextWritten += AppendLogText;
         LoadSettingsIntoUi();
+        AppendLine(AdminRights.IsGranted()
+            ? "[gui] Права администратора: есть."
+            : "[gui] [!] Запуск без прав администратора.");
     }
 
     // ---------- Построение интерфейса ----------
