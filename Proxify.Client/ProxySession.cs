@@ -73,9 +73,13 @@ public sealed class ProxySession : IDisposable
         Console.WriteLine();
     }
 
-    public async Task RunAsync()
+    /// <param name="externalToken">
+    /// Внешний токен отмены: консольный клиент не передаёт его (используется Ctrl+C),
+    /// GUI-клиент передаёт токен кнопки «Остановить».
+    /// </param>
+    public async Task RunAsync(CancellationToken externalToken = default)
     {
-        using var cts = new CancellationTokenSource();
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(externalToken);
         Console.CancelKeyPress += (_, e) =>
         {
             e.Cancel = true;
