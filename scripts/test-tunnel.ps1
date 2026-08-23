@@ -3,6 +3,9 @@
     [string]$Config = "",
     [int]$TunnelPort = 5600,
     [int]$Port = 27015,
+    # Отдельный TCP-порт: на некоторых машинах 127.0.0.1:27015 занимает
+    # AppleMobileDeviceService, и подключения уходят не нашему серверу.
+    [int]$TcpPort = 27555,
     [int]$GamePort = 7777,
     [switch]$Tcp = $true,
     [switch]$NoTcp
@@ -96,15 +99,45 @@ function Unwrap-Data {
     }
 }
 
-function Receive-FromSocket {
+function Receive-TunnelFrame {
+    # Принимает датаграмму, снимает внешнюю маскирующую оболочку (wire-ключ s2c)
+    # и возвращает внутренний кадр.
     param([System.Net.Sockets.UdpClient]$Socket, [int]$TimeoutMs, [string]$What)
     $Socket.Client.ReceiveTimeout = $TimeoutMs
     $ep = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
     $data = $Socket.Receive([ref]$ep)
-    if ($data.Length -lt 3 -or $data[0] -ne 0xC0 -or $data[1] -ne 0xDE) {
-        throw "${What}: получен не наш кадр (нет magic)"
+    try {
+        $inner = Unwrap-Data -Key $script:wireKeyS2C -Blob $data
+    } catch {
+        throw "${What}: получен нераспознаваемый датаграмм (не прошёл внешний AEAD-слой)"
     }
-    return , $data
+    if ($inner.Length -lt 3 -or $inner[0] -ne 0xC0 -or $inner[1] -ne 0xDE) {
+        throw "${What}: во внутреннем кадре нет magic"
+    }
+    return , $inner
+}
+
+function Initialize-WireKeys {
+    # Внешние ключи маскировки из SPKI публичного ключа клиента (как WireObfuscator).
+    param([System.Security.Cryptography.ECDsa]$IdentityKey)
+    $spki = $IdentityKey.ExportSubjectPublicKeyInfo()
+    $script:wireKeyC2S = [System.Security.Cryptography.HKDF]::DeriveKey(
+        [System.Security.Cryptography.HashAlgorithmName]::SHA256,
+        $spki, 32,
+        [Text.Encoding]::UTF8.GetBytes("proxify-wire-v2"),
+        [Text.Encoding]::UTF8.GetBytes("proxify-wire-v2-c2s"))
+    $script:wireKeyS2C = [System.Security.Cryptography.HKDF]::DeriveKey(
+        [System.Security.Cryptography.HashAlgorithmName]::SHA256,
+        $spki, 32,
+        [Text.Encoding]::UTF8.GetBytes("proxify-wire-v2"),
+        [Text.Encoding]::UTF8.GetBytes("proxify-wire-v2-s2c"))
+}
+
+function Send-TunnelFrame {
+    # Шифрует внутренний кадр внешней оболочкой (wire-ключ c2s) и отправляет серверу.
+    param([byte[]]$Inner)
+    $datagram = Wrap-Data -Key $script:wireKeyC2S -Plain $Inner
+    [void]$tunnel.Send($datagram, $datagram.Length, "127.0.0.1", $TunnelPort)
 }
 
 function Build-AuthFrame {
@@ -228,13 +261,13 @@ function Build-TcpAckFrame {
 function Send-TcpAck {
     param([uint32]$ConnId, [uint32]$AckSeq, [byte[]]$Key)
     $ack = Build-TcpAckFrame -ConnId $ConnId -AckSeq $AckSeq -Key $Key
-    [void]$tunnel.Send($ack, $ack.Length, "127.0.0.1", $TunnelPort)
+    Send-TunnelFrame -Inner $ack
 }
 
 function Read-TcpData {
     param([uint32]$ConnId, [byte[]]$Key, [int]$TimeoutMs = 3000, [bool]$Ack = $true)
     while ($true) {
-        $fr = Receive-FromSocket -Socket $tunnel -TimeoutMs $TimeoutMs -What "TcpData"
+        $fr = Receive-TunnelFrame -Socket $tunnel -TimeoutMs $TimeoutMs -What "TcpData"
         $frType = $fr[2]
         if ($frType -eq 10) { continue }  # TcpAck — подтверждение наших кадров, игнорируем
         if ($frType -ne 6) { throw "Ожидался TcpData (0x06), получен 0x$('{0:X2}' -f $frType)" }
@@ -267,6 +300,7 @@ if (-not (Test-Path $serverDll)) {
 $keyPem = Get-Content -LiteralPath $Key -Raw
 $identity = [System.Security.Cryptography.ECDsa]::Create()
 $identity.ImportFromPem($keyPem)
+Initialize-WireKeys -IdentityKey $identity
 
 $workDir = Join-Path $env:TEMP "proxify-test-$(Get-Random)"
 New-Item -ItemType Directory -Path $workDir | Out-Null
@@ -289,7 +323,7 @@ if ([string]::IsNullOrEmpty($configPath)) {
                 capture    = $true
                 aliases    = $false
                 tcp        = $tcpEnabled
-                tcpPort    = $Port
+                tcpPort    = $TcpPort
             }
         )
     } | ConvertTo-Json -Depth 5
@@ -330,9 +364,18 @@ try {
             $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
             try { $rng.GetBytes($badNonce) } finally { $rng.Dispose() }
             $badAuth = Build-AuthFrame -Key $badKey -Ecdh $badEcdh -Nonce $badNonce
+            # Оборачиваем Auth ключами ЧУЖОГО клиента (как делал бы реальный клиент
+            # с незарегистрированной парой): сервер не сможет расшифровать кадр.
+            $badSpki = $badKey.ExportSubjectPublicKeyInfo()
+            $badWire = [System.Security.Cryptography.HKDF]::DeriveKey(
+                [System.Security.Cryptography.HashAlgorithmName]::SHA256,
+                $badSpki, 32,
+                [Text.Encoding]::UTF8.GetBytes("proxify-wire-v2"),
+                [Text.Encoding]::UTF8.GetBytes("proxify-wire-v2-c2s"))
+            $badDatagram = Wrap-Data -Key $badWire -Plain $badAuth
             $negTunnel = New-Object System.Net.Sockets.UdpClient
             try {
-                [void]$negTunnel.Send($badAuth, $badAuth.Length, "127.0.0.1", $TunnelPort)
+                [void]$negTunnel.Send($badDatagram, $badDatagram.Length, "127.0.0.1", $TunnelPort)
                 $negTunnel.Client.ReceiveTimeout = 1200
                 $negEp = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
                 $rejected = $true
@@ -367,10 +410,10 @@ try {
     $ecdh = [System.Security.Cryptography.ECDiffieHellman]::Create([System.Security.Cryptography.ECCurve+NamedCurves]::nistP256)
 
     $auth = Build-AuthFrame -Key $identity -Ecdh $ecdh -Nonce $nonce
-    [void]$tunnel.Send($auth, $auth.Length, "127.0.0.1", $TunnelPort)
+    Send-TunnelFrame -Inner $auth
     Write-Host "[1] Auth отправлен, локальный порт туннеля $($tunnel.Client.LocalEndPoint.Port)"
 
-    $ack = Receive-FromSocket -Socket $tunnel -TimeoutMs 3000 -What "AuthAck"
+    $ack = Receive-TunnelFrame -Socket $tunnel -TimeoutMs 3000 -What "AuthAck"
     if ($ack[2] -ne 0x09) { throw "Ожидался кадр AuthAck (0x09), получен 0x$('{0:X2}' -f $ack[2])" }
     if ($ack.Length -lt 3 + 32 + 32 + 28) { throw "AuthAck слишком короткий" }
     $sX = New-Object byte[] 32
@@ -399,8 +442,8 @@ try {
     $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
     try { $rng.GetBytes($pingToken) } finally { $rng.Dispose() }
     $ping = Build-ControlFrame -Type 3 -Body $pingToken -Key $sessionKey
-    [void]$tunnel.Send($ping, $ping.Length, "127.0.0.1", $TunnelPort)
-    $pong = Receive-FromSocket -Socket $tunnel -TimeoutMs 3000 -What "PONG"
+    Send-TunnelFrame -Inner $ping
+    $pong = Receive-TunnelFrame -Socket $tunnel -TimeoutMs 3000 -What "PONG"
     $pongBody = Decode-EncryptedBody -Frame $pong -Key $sessionKey -ExpectedType 4
     if ($pongBody.Length -ne 17) { throw "Неверный формат PONG" }
     for ($i = 0; $i -lt 16; $i++) {
@@ -416,14 +459,14 @@ try {
     [void]$player.Send($hello, $hello.Length)
     Write-Host "[4] Игрок отправил 'HELLO' на 127.0.0.1:$playerPort"
 
-    $frame = Receive-FromSocket -Socket $tunnel -TimeoutMs 3000 -What "кадр данных"
+    $frame = Receive-TunnelFrame -Socket $tunnel -TimeoutMs 3000 -What "кадр данных"
     $decoded = Decode-DataFrame -Frame $frame -Key $sessionKey
     Write-Host "[5] Кадр от сервера: клиент=$($decoded.ClientIp):$($decoded.ClientPort) payload='$($decoded.PayloadText)'"
     if ($decoded.PayloadText -ne "HELLO") { throw "Кадр не соответствует ожидаемому формату" }
 
     $reply = [Text.Encoding]::UTF8.GetBytes("REPLY")
     $rf = Build-EncryptedDataFrame -ClientIp $decoded.ClientIp -ClientPort $decoded.ClientPort -Payload $reply -Key $sessionKey
-    [void]$tunnel.Send($rf, $rf.Length, "127.0.0.1", $TunnelPort)
+    Send-TunnelFrame -Inner $rf
     Write-Host "[6] Эмуляция прокси-клиента отправила кадр-ответ."
 
     $player.Client.ReceiveTimeout = 3000
@@ -436,12 +479,12 @@ try {
 
     # --- 4. TCP (если включено в конфиге) ---
     if ($tcpEnabled) {
-        Write-Host "[TCP 1] Игрок подключается по TCP к 127.0.0.1:$playerPort"
-        $tcpClient = New-Object System.Net.Sockets.TcpClient("127.0.0.1", $playerPort)
+        Write-Host "[TCP 1] Игрок подключается по TCP к 127.0.0.1:$TcpPort"
+        $tcpClient = New-Object System.Net.Sockets.TcpClient("127.0.0.1", $TcpPort)
         $tcpStream = $tcpClient.GetStream()
         $tcpStream.ReadTimeout = 3000
 
-        $openFrame = Receive-FromSocket -Socket $tunnel -TimeoutMs 3000 -What "TcpOpen"
+        $openFrame = Receive-TunnelFrame -Socket $tunnel -TimeoutMs 3000 -What "TcpOpen"
         $openBody = Decode-EncryptedBody -Frame $openFrame -Key $sessionKey -ExpectedType 5
         if ($openBody.Length -ne 10) { throw "Неверный формат TcpOpen" }
         $connId = Read-U32BE -Bytes $openBody -Offset 6
@@ -456,7 +499,7 @@ try {
 
         $echo = [Text.Encoding]::UTF8.GetBytes($recvText)
         $echoFrame = Build-TcpDataFrame -ConnId $connId -Seq 0 -Payload $echo -Key $sessionKey
-        [void]$tunnel.Send($echoFrame, $echoFrame.Length, "127.0.0.1", $TunnelPort)
+        Send-TunnelFrame -Inner $echoFrame
         Write-Host "[TCP 4] Эмуляция игрового сервера ответила кадром TcpData (seq=0)."
 
         $replyBuf = New-Object byte[] 1024
@@ -515,7 +558,7 @@ try {
         $closeFrame = $null
         $deadline = (Get-Date).AddSeconds(4)
         while ($null -eq $closeFrame -and (Get-Date) -lt $deadline) {
-            $fr = Receive-FromSocket -Socket $tunnel -TimeoutMs 1000 -What "TcpClose"
+            $fr = Receive-TunnelFrame -Socket $tunnel -TimeoutMs 1000 -What "TcpClose"
             if ($fr[2] -eq 10) { continue }  # TcpAck — игнорируем
             if ($fr[2] -ne 7) { throw "Ожидался TcpClose, получен 0x$('{0:X2}' -f $fr[2])" }
             $closeFrame = $fr

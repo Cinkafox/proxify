@@ -11,9 +11,11 @@ namespace Proxify.Server;
 ///
 /// Владеет общим туннельным UDP-сокетом, создаёт по одному <see cref="ProxySession"/>
 /// на каждого зарегистрированного клиента и распределяет кадры туннеля по сессиям.
-/// Кадр Auth (всегда plaintext) разбирается здесь и направляется сессиям, которые
-/// проверяют подпись своим ключом; после успешной авторизации адрес туннеля
-/// привязывается к сессии, и все дальнейшие кадры от этого адреса передаются ей.
+/// Все датаграммы приходят во внешней маскирующей оболочке (WireObfuscator): ключ
+/// выводится из зарегистрированного публичного ключа клиента, поэтому расшифровать
+/// кадр может только владелец соответствующего закрытого ключа. Расшифровка и
+/// служит опознанием клиента; кадр Auth принимается только от ещё не
+/// авторизованных адресов.
 /// </summary>
 public sealed class ProxyServer : IDisposable
 {
@@ -52,6 +54,8 @@ public sealed class ProxyServer : IDisposable
         }
         Console.WriteLine();
         Console.WriteLine("Шифрование: ECDSA P-256 (аутентификация) + ECDH P-256 + HKDF-SHA256 + AES-256-GCM");
+        Console.WriteLine("Все датаграммы туннеля дополнительно закрыты внешним AEAD-слоем от ключа клиента:");
+        Console.WriteLine("на проводе нет ни сигнатуры протокола, ни открытого рукопожатия.");
         Console.WriteLine();
         Console.WriteLine("Открытые порты нужны только у машины A: игроки идут на свой UDP-порт клиента,");
         Console.WriteLine("а прокси-клиенты (машины B) сами устанавливают исходящее соединение на --tunnel-port.");
@@ -110,55 +114,73 @@ public sealed class ProxyServer : IDisposable
     {
         try
         {
-            var frameType = Frame.PeekFrameType(data, data.Length);
-
-            // --- Рукопожатие: кадр Auth (всегда plaintext) ---
-            if (frameType == Frame.TypeAuth)
+            // --- Известный адрес туннеля: расшифровываем его wire-ключом ---
+            if (_active.TryGetValue(from, out var session) &&
+                session.Client.Wire.TryUnwrap(data, data.Length, out var inner))
             {
-                if (!Frame.TryDecodeAuth(data, data.Length, out var version, out var ephX, out var ephY, out var nonce, out var signature))
-                {
-                    Interlocked.Increment(ref Stats.BadFrames);
-                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Не удалось разобрать кадр Auth от {from}.");
-                    return;
-                }
-
-                if (version != TunnelKeys.AuthVersion)
-                {
-                    Interlocked.Increment(ref Stats.BadFrames);
-                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Auth от {from} с неизвестной версией {version}.");
-                    return;
-                }
-
-                // Ищем клиента по подписи: подписать кадр может только владелец закрытого ключа.
-                var payload = TunnelKeys.BuildAuthPayload(ephX, ephY, nonce);
-                foreach (var candidate in Sessions)
-                {
-                    if (candidate.TryAuthenticate(from, payload, signature, ephX, ephY, nonce))
-                    {
-                        _active[from] = candidate;
-                        return;
-                    }
-                }
-
-                Interlocked.Increment(ref Stats.BadFrames);
-                Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Auth от {from}: подпись не соответствует ни одному зарегистрированному ключу.");
+                await session.HandleFrameAsync(from, inner);
                 return;
             }
 
-            // --- Остальные кадры принимаются только от авторизованной сессии ---
-            if (!_active.TryGetValue(from, out var session) || session.Client.Cipher == null)
+            // --- Неизвестный адрес: допускается только рукопожатие Auth ---
+            // Опознание происходит по самой расшифровке: верный wire-ключ есть
+            // только у владельца зарегистрированного закрытого ключа.
+            foreach (var candidate in Sessions)
             {
-                Interlocked.Increment(ref Stats.BadFrames);
-                LogUnknownFrame(from);
+                if (!candidate.Client.Wire.TryUnwrap(data, data.Length, out inner))
+                    continue;
+
+                var frameType = Frame.PeekFrameType(inner, inner.Length);
+                if (frameType != Frame.TypeAuth)
+                {
+                    Interlocked.Increment(ref Stats.BadFrames);
+                    LogUnknownFrame(from);
+                    return;
+                }
+
+                HandleAuthFrame(candidate, from, inner);
                 return;
             }
 
-            await session.HandleFrameAsync(from, data);
+            Interlocked.Increment(ref Stats.BadFrames);
+            LogUnknownFrame(from);
         }
         catch (Exception ex)
         {
             Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [ошибка] {ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// Разбирает и проверяет кадр Auth, расшифрованный wire-ключом кандидата.
+    /// Подпись ECDSA подтверждает владение закрытым ключом; при успехе сессия
+    /// активируется и привязывается к адресу отправителя.
+    /// </summary>
+    private void HandleAuthFrame(ProxySession candidate, IPEndPoint from, byte[] inner)
+    {
+        if (!Frame.TryDecodeAuth(inner, inner.Length, out var version, out var ephX, out var ephY, out var nonce, out var signature))
+        {
+            Interlocked.Increment(ref Stats.BadFrames);
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Не удалось разобрать кадр Auth от {from}.");
+            return;
+        }
+
+        if (version != TunnelKeys.AuthVersion)
+        {
+            Interlocked.Increment(ref Stats.BadFrames);
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Auth от {from} с неизвестной версией {version}.");
+            return;
+        }
+
+        var payload = TunnelKeys.BuildAuthPayload(ephX, ephY, nonce);
+        if (!candidate.TryAuthenticate(from, payload, signature, ephX, ephY, nonce))
+        {
+            Interlocked.Increment(ref Stats.BadFrames);
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Auth от {from}: подпись не соответствует зарегистрированному ключу клиента '{candidate.Client.DisplayName}'.");
+            return;
+        }
+
+        _active[from] = candidate;
     }
 
     private void LogUnknownFrame(IPEndPoint from)

@@ -30,6 +30,11 @@ public static class TunnelKeys
     public const string AuthInfo = "proxify-auth-v1";
     public const string SessionInfo = "proxify-session-v1";
 
+    /// <summary>Salt и info-метки для вывода внешних wire-ключей (см. WireObfuscator).</summary>
+    public const string WireSalt = "proxify-wire-v2";
+    public const string WireInfoClientToServer = "proxify-wire-v2-c2s";
+    public const string WireInfoServerToClient = "proxify-wire-v2-s2c";
+
     public const byte AuthVersion = 1;
 
     public const int PointSize = 32;
@@ -132,6 +137,25 @@ public static class TunnelKeys
         nonce.CopyTo(payload.AsSpan(o));
         return payload;
     }
+
+    /// <summary>
+    /// Экспортирует канонические SPKI (DER) байты публичного ключа.
+    /// Одинаковый результат для закрытого ключа клиента и его публичного PEM
+    /// на сервере — основа для вывода wire-ключей.
+    /// </summary>
+    public static byte[] ExportSpkiDer(ECDsa key) => key.ExportSubjectPublicKeyInfo();
+
+    /// <summary>
+    /// Выводит внешний wire-ключ маскировки из SPKI-байт зарегистрированного ключа:
+    /// HKDF-SHA256(ikm=SPKI-DER, salt=WireSalt, info=направление).
+    /// </summary>
+    public static byte[] DeriveWireKey(byte[] registeredSpkiDer, string info)
+        => HKDF.DeriveKey(
+            HashAlgorithmName.SHA256,
+            registeredSpkiDer,
+            SessionKeySize,
+            Encoding.UTF8.GetBytes(WireSalt),
+            Encoding.UTF8.GetBytes(info));
 
     /// <summary>
     /// Создаёт новый эфемерный ключ ECDH на кривой P-256 (на одну попытку рукопожатия).

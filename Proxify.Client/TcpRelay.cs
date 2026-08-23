@@ -46,6 +46,7 @@ public sealed class TcpRelay : IDisposable
     private readonly UdpClient _tunnel;
     private readonly IPEndPoint _proxyServer;
     private readonly Func<TunnelCipher?> _cipherGetter;
+    private readonly WireObfuscator _wire;
     private readonly TunnelStats _stats;
     private readonly ServerTcpStatus _serverTcp;
     private readonly ConcurrentDictionary<uint, TcpSession> _sessions = new();
@@ -58,7 +59,8 @@ public sealed class TcpRelay : IDisposable
         IPEndPoint proxyServer,
         Func<TunnelCipher?> cipherGetter,
         TunnelStats stats,
-        ServerTcpStatus serverTcp)
+        ServerTcpStatus serverTcp,
+        WireObfuscator wire)
     {
         _gameIp = gameIp;
         _gamePort = gamePort;
@@ -67,6 +69,7 @@ public sealed class TcpRelay : IDisposable
         _cipherGetter = cipherGetter;
         _stats = stats;
         _serverTcp = serverTcp;
+        _wire = wire;
     }
 
     /// <summary>
@@ -108,7 +111,7 @@ public sealed class TcpRelay : IDisposable
             return;
         }
 
-        var session = new TcpSession(connId, _gameIp, _gamePort, _tunnel, _proxyServer, _cipherGetter, _stats, this);
+        var session = new TcpSession(connId, _gameIp, _gamePort, _tunnel, _proxyServer, _cipherGetter, _stats, this, _wire);
         if (_sessions.TryAdd(connId, session))
         {
             _ = Task.Run(session.RunAsync);
@@ -185,6 +188,7 @@ public sealed class TcpRelay : IDisposable
         private readonly UdpClient _tunnel;
         private readonly IPEndPoint _proxyServer;
         private readonly Func<TunnelCipher?> _cipherGetter;
+        private readonly WireObfuscator _wire;
         private readonly TunnelStats _stats;
         private readonly TcpRelay _relay;
         private readonly TcpReliableSender _sender;
@@ -204,7 +208,8 @@ public sealed class TcpRelay : IDisposable
             IPEndPoint proxyServer,
             Func<TunnelCipher?> cipherGetter,
             TunnelStats stats,
-            TcpRelay relay)
+            TcpRelay relay,
+            WireObfuscator wire)
         {
             _connId = connId;
             _gameIp = gameIp;
@@ -214,6 +219,7 @@ public sealed class TcpRelay : IDisposable
             _cipherGetter = cipherGetter;
             _stats = stats;
             _relay = relay;
+            _wire = wire;
             _sender = new TcpReliableSender(connId, SendTcpDataFrame);
             _receiver = new TcpReliableReceiver(connId, payload => _toGame.Writer.TryWrite(payload), SendTcpAck);
         }
@@ -345,7 +351,7 @@ public sealed class TcpRelay : IDisposable
                 return;
 
             var frame = Frame.EncodeTcpData(connId, seq, payload, cipher);
-            _tunnel.Send(frame, _proxyServer);
+            _tunnel.Send(_wire.Wrap(frame), _proxyServer);
             Interlocked.Increment(ref _stats.PacketsOut);
             Interlocked.Increment(ref _stats.RepliesRelayed);
         }
@@ -359,7 +365,7 @@ public sealed class TcpRelay : IDisposable
             if (cipher == null)
                 return;
 
-            _tunnel.Send(Frame.EncodeTcpAck(connId, ackSeq, cipher), _proxyServer);
+            _tunnel.Send(_wire.Wrap(Frame.EncodeTcpAck(connId, ackSeq, cipher)), _proxyServer);
         }
 
         private void SendClose()
@@ -373,8 +379,9 @@ public sealed class TcpRelay : IDisposable
 
             // TcpClose — «управляющий» кадр без подтверждения: на линиях с потерями
             // датаграмма может пропасть, поэтому отправляем несколько раз (повторы
-            // на принимающей стороне идемпотентны).
-            var frame = Frame.EncodeTcpClose(_connId, cipher);
+            // на принимающей стороне идемпотентны). Шифруем один раз — все копии
+            // идентичны.
+            var frame = _wire.Wrap(Frame.EncodeTcpClose(_connId, cipher));
             for (var i = 0; i < 3; i++)
             {
                 try

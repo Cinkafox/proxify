@@ -22,6 +22,14 @@ public sealed class ClientSession : IDisposable
 
     public ClientConfig Config { get; }
     public ECDsa RegisteredKey { get; }
+
+    /// <summary>
+    /// Внешний слой маскировки датаграмм туннеля для этого клиента.
+    /// Ключи выводятся из зарегистрированного публичного ключа, поэтому
+    /// доступны сразу — ещё до рукопожатия (кадр Auth тоже приходит в оболочке).
+    /// </summary>
+    public WireObfuscator Wire { get; }
+
     public UdpClient Udp { get; }
     public TcpListener? TcpListener { get; }
 
@@ -45,6 +53,7 @@ public sealed class ClientSession : IDisposable
     {
         Config = config;
         RegisteredKey = TunnelKeys.ImportPublicPem(config.PublicKeyPem);
+        Wire = WireObfuscator.Create(RegisteredKey, weAreClient: false);
         Udp = new UdpClient(new IPEndPoint(IPAddress.Any, config.Port));
         if (config.TcpEnabled)
             TcpListener = new TcpListener(IPAddress.Any, config.TcpPort);

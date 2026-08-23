@@ -23,6 +23,7 @@ public sealed class ProxySession : IDisposable
     private static readonly TimeSpan HeartbeatInterval = TimeSpan.FromSeconds(10);
 
     private readonly ECDsa _identityKey;
+    private readonly WireObfuscator _wire;
     private readonly object _authLock = new();
 
     private ECDiffieHellman? _ephemeral;
@@ -55,6 +56,7 @@ public sealed class ProxySession : IDisposable
     {
         ProxyServer = proxyServer;
         _identityKey = identityKey;
+        _wire = WireObfuscator.Create(identityKey, weAreClient: true);
         Tunnel = new UdpClient();
         Tunnel.Client.Bind(new IPEndPoint(IPAddress.Any, localPort ?? 0));
         InjectWork = new AsyncWorkQueue(Math.Clamp(Environment.ProcessorCount, 2, 8));
@@ -70,6 +72,7 @@ public sealed class ProxySession : IDisposable
         Console.WriteLine($"Loopback-алиасы           : {(config.LoopbackAliases ? "вкл" : "выкл")}");
         Console.WriteLine($"TCP-проксирование         : {(config.TcpEnabled ? "вкл" : "выкл")}");
         Console.WriteLine("Шифрование туннеля        : ECDSA P-256 + ECDH P-256 + AES-256-GCM (сессионный ключ)");
+        Console.WriteLine("Маскировка датаграмм      : внешний AEAD-слой от ключа клиента (на проводе только случайные байты)");
         Console.WriteLine();
     }
 
@@ -123,11 +126,11 @@ public sealed class ProxySession : IDisposable
         var aliases = new LoopbackAliasManager(config.LoopbackAliases);
         _aliases = aliases;
         _injector = new RawInjector(config.GameIp, config.GamePort);
-        _tcpRelay = new TcpRelay(config.GameIp, config.GamePort, Tunnel, ProxyServer, () => Cipher, Stats, ServerTcp);
+        _tcpRelay = new TcpRelay(config.GameIp, config.GamePort, Tunnel, ProxyServer, () => Cipher, Stats, ServerTcp, _wire);
 
         if (config.CaptureReplies)
         {
-            _sniffer = new ReplySniffer(IPAddress.Loopback, config.GamePort, KnownClients, Tunnel, ProxyServer, () => Cipher, Stats, cts.Token);
+            _sniffer = new ReplySniffer(IPAddress.Loopback, config.GamePort, KnownClients, Tunnel, ProxyServer, () => Cipher, Stats, cts.Token, _wire);
             tasks.Add(Task.Run(_sniffer.Run));
         }
 
@@ -225,7 +228,8 @@ public sealed class ProxySession : IDisposable
 
         try
         {
-            Tunnel.Send(frame, ProxyServer);
+            // Рукопожатие уходит в той же маскирующей оболочке, что и все кадры.
+            Tunnel.Send(_wire.Wrap(frame), ProxyServer);
         }
         catch (SocketException ex)
         {
@@ -331,16 +335,27 @@ public sealed class ProxySession : IDisposable
                 continue;
             }
 
-            var frameType = Frame.PeekFrameType(result.Buffer, result.Buffer.Length);
+            // Внешний слой маскировки: без верного wire-ключа датаграмма не читается.
+            // Кадр со старой сигнатурой (C0DE без оболочки) означает устаревшую
+            // версию другой стороны.
+            if (!_wire.TryUnwrap(result.Buffer, result.Buffer.Length, out var data))
+            {
+                if (Frame.PeekFrameType(result.Buffer, result.Buffer.Length) != null)
+                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Получен немаскированный кадр — на другой стороне старая версия ПО.");
+                Interlocked.Increment(ref Stats.BadFrames);
+                continue;
+            }
+
+            var frameType = Frame.PeekFrameType(data, data.Length);
             if (frameType is Frame.TypeTcpOpen or Frame.TypeTcpData or Frame.TypeTcpClose or Frame.TypeTcpAck)
             {
-                _tcpRelay?.OnFrame(result.Buffer, result.Buffer.Length);
+                _tcpRelay?.OnFrame(data, data.Length);
                 continue;
             }
 
             if (frameType == Frame.TypeAuthAck)
             {
-                HandleAuthAck(result.Buffer, result.Buffer.Length);
+                HandleAuthAck(data, data.Length);
                 continue;
             }
 
@@ -351,7 +366,7 @@ public sealed class ProxySession : IDisposable
             if (frameType == Frame.TypePong)
             {
                 // Сервер каждым PONG сообщает, включено ли у него TCP-проксирование.
-                if (Frame.TryDecodePong(result.Buffer, result.Buffer.Length, cipher, 16, out _, out var tcpFlag))
+                if (Frame.TryDecodePong(data, data.Length, cipher, 16, out _, out var tcpFlag))
                 {
                     Interlocked.Exchange(ref _lastPongTicks, DateTime.UtcNow.Ticks);
                     ServerTcp.Set(tcpFlag);
@@ -371,10 +386,10 @@ public sealed class ProxySession : IDisposable
                 continue;
             }
 
-            if (!Frame.TryDecodeData(result.Buffer, result.Buffer.Length, cipher, out var clientIp, out var clientPort, out var payload))
+            if (!Frame.TryDecodeData(data, data.Length, cipher, out var clientIp, out var clientPort, out var payload))
             {
                 Interlocked.Increment(ref Stats.BadFrames);
-                Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Не удалось разобрать кадр ({result.Buffer.Length} байт).");
+                Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Не удалось разобрать кадр ({data.Length} байт).");
                 continue;
             }
 
@@ -421,7 +436,7 @@ public sealed class ProxySession : IDisposable
                 if (cipher != null)
                 {
                     var ping = Frame.EncodeControl(Frame.TypePing, Guid.NewGuid().ToByteArray(), cipher);
-                    await Tunnel.SendAsync(ping, ping.Length, ProxyServer);
+                    await Tunnel.SendAsync(_wire.Wrap(ping), ProxyServer);
                 }
             }
             catch (SocketException)

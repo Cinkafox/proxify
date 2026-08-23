@@ -70,7 +70,7 @@ public sealed class ProxySession : IDisposable
         var ack = Frame.EncodeAuthAck(sX, sY, proof);
         try
         {
-            _tunnel.Send(ack, from);
+            _tunnel.Send(_client.Wire.Wrap(ack), from);
         }
         catch (Exception ex)
         {
@@ -94,7 +94,7 @@ public sealed class ProxySession : IDisposable
             if (Frame.TryDecodeControl(data, data.Length, Frame.TypePing, cipher, out var token))
             {
                 _client.TouchActivity();
-                await _tunnel.SendAsync(Frame.EncodePong(token, _client.Config.TcpEnabled, cipher), from);
+                await _tunnel.SendAsync(_client.Wire.Wrap(Frame.EncodePong(token, _client.Config.TcpEnabled, cipher)), from);
             }
             else
             {
@@ -262,7 +262,7 @@ public sealed class ProxySession : IDisposable
             Interlocked.Increment(ref _stats.PacketsIn);
             Interlocked.Increment(ref _stats.PacketsOut);
             var frame = Frame.EncodeData(from.Address, (ushort)from.Port, data, cipher);
-            await _tunnel.SendAsync(frame, proxyEndpoint);
+            await _tunnel.SendAsync(_client.Wire.Wrap(frame), proxyEndpoint);
         }
         catch (Exception ex)
         {
@@ -310,7 +310,6 @@ public sealed class ProxySession : IDisposable
                     return;
                 }
             }
-
             var connId = NextTcpConnId();
             tcpClient.NoDelay = true;
             _client.TcpClients[connId] = tcpClient;
@@ -324,7 +323,7 @@ public sealed class ProxySession : IDisposable
             Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [диагностика] Клиент '{_client.DisplayName}': новый TCP-клиент {remote} (connId {connId}).");
 
             var open = Frame.EncodeTcpOpen(remote.Address, (ushort)remote.Port, connId, cipher);
-            await _tunnel.SendAsync(open, proxy);
+            await _tunnel.SendAsync(_client.Wire.Wrap(open), proxy);
 
             _ = Task.Run(() => HandleTcpClientAsync(tcpClient, connId, sender));
         }
@@ -408,8 +407,9 @@ public sealed class ProxySession : IDisposable
         try
         {
             // TcpClose — управляющий кадр без подтверждения: дублируем, чтобы потеря
-            // единственной датаграммы не оставила висящее соединение (повторы идемпотентны).
-            var frame = Frame.EncodeTcpClose(connId, cipher);
+            // единственной датаграммы не оставила висящее соединение (повторы
+            // идемпотентны). Шифруем один раз — все копии идентичны.
+            var frame = _client.Wire.Wrap(Frame.EncodeTcpClose(connId, cipher));
             for (var i = 0; i < 3; i++)
             {
                 await _tunnel.SendAsync(frame, proxy);
@@ -438,7 +438,7 @@ public sealed class ProxySession : IDisposable
             return;
 
         Interlocked.Increment(ref _stats.PacketsOut);
-        _tunnel.Send(Frame.EncodeTcpData(connId, seq, payload, cipher), proxy);
+        _tunnel.Send(_client.Wire.Wrap(Frame.EncodeTcpData(connId, seq, payload, cipher)), proxy);
     }
 
     /// <summary>
@@ -451,7 +451,7 @@ public sealed class ProxySession : IDisposable
         if (proxy == null || cipher == null)
             return;
 
-        _tunnel.Send(Frame.EncodeTcpAck(connId, ackSeq, cipher), proxy);
+        _tunnel.Send(_client.Wire.Wrap(Frame.EncodeTcpAck(connId, ackSeq, cipher)), proxy);
     }
 
     /// <summary>
