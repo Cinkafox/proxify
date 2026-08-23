@@ -11,7 +11,8 @@ var cli = new ArgParser("Proxify.Client")
     .Add("tunnel-port", "UDP-порт туннеля ПРОКСИ-СЕРВЕРА (машины A), если он не указан в --server", shortName: 't')
     .Add("local-port", "Локальный UDP-порт туннеля клиента. Если не задан, ОС выберет свободный (port 0). Полезно для файрволов.", shortName: 'l')
     .Add("key", "Путь к закрытому ключу клиента (PEM, PKCS#8). Создаётся командой --keygen", shortName: 'k')
-    .Add("keygen", "Сгенерировать пару ключей в указанном каталоге (client-private.pem, client-public.pem) и выйти", shortName: 'g');
+    .Add("keygen", "Сгенерировать пару ключей в указанном каталоге (client-private.pem, client-public.pem) и выйти", shortName: 'g')
+    .Add("wire-obfuscation", "Внешняя маскировка туннеля: on или off (по умолчанию). Должна совпадать с настройкой 'obfuscation' в конфиге сервера", defaultValue: "off");
 
 if (!cli.TryParse(args))
 {
@@ -98,7 +99,27 @@ if (!string.IsNullOrWhiteSpace(localPortText))
     localPort = lp;
 }
 
-using var session = new ProxySession(proxyServer, identityKey, localPort);
+bool wireObfuscation;
+switch ((cli.Get("wire-obfuscation") ?? "off").Trim().ToLowerInvariant())
+{
+    case "on":
+    case "вкл":
+    case "true":
+    case "1":
+        wireObfuscation = true;
+        break;
+    case "off":
+    case "выкл":
+    case "false":
+    case "0":
+        wireObfuscation = false;
+        break;
+    default:
+        Console.WriteLine("[ошибка конфигурации] --wire-obfuscation принимает только on|off.");
+        return 1;
+}
+
+using var session = new ProxySession(proxyServer, identityKey, localPort, wireObfuscation);
 
 try
 {

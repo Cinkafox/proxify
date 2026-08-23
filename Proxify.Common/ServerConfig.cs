@@ -20,7 +20,8 @@ namespace Proxify.Common;
 ///       "capture": true,                      // перехват ответов (по умолч. true)
 ///       "aliases": true,                      // loopback-алиасы (по умолч. true)
 ///       "tcp": false,                         // TCP-проксирование (по умолч. false)
-///       "tcpPort": 27015                      // TCP-порт на машине A (по умолч. = port)
+///       "tcpPort": 27015,                     // TCP-порт на машине A (по умолч. = port)
+///       "obfuscation": false                  // внешняя маскировка туннеля (по умолч. false)
 ///     }
 ///   ]
 /// }
@@ -132,7 +133,8 @@ public static class ServerConfig
                 "      \"capture\": true,\n" +
                 "      \"aliases\": true,\n" +
                 "      \"tcp\": false,\n" +
-                "      \"tcpPort\": 27015\n" +
+                "      \"tcpPort\": 27015,\n" +
+                "      \"obfuscation\": false\n" +
                 "    }\n" +
                 "  ]\n" +
                 "}\n";
@@ -228,6 +230,7 @@ public static class ServerConfig
         result.CaptureReplies = GetBool(item, "capture", true);
         result.LoopbackAliases = GetBool(item, "aliases", true);
         result.TcpEnabled = GetBool(item, "tcp", false);
+        result.WireObfuscation = GetBool(item, "obfuscation", false);
 
         result.TcpPort = result.Port;
         if (TryGetInt(item, "tcpPort", configPath, index, out var tcpPort))

@@ -24,7 +24,7 @@ public sealed class ProxySession : IDisposable
     private static readonly TimeSpan HeartbeatMaxInterval = TimeSpan.FromSeconds(15);
 
     private readonly ECDsa _identityKey;
-    private readonly WireObfuscator _wire;
+    private readonly WireObfuscator? _wire;
     private readonly object _authLock = new();
 
     private ECDiffieHellman? _ephemeral;
@@ -54,15 +54,21 @@ public sealed class ProxySession : IDisposable
     /// <summary>Активные IP игроков (для loopback-алиасов и очистки по таймауту).</summary>
     public ConcurrentDictionary<IPAddress, DateTime> ActiveIps { get; } = new();
 
-    public ProxySession(IPEndPoint proxyServer, ECDsa identityKey, int? localPort = null)
+    public ProxySession(IPEndPoint proxyServer, ECDsa identityKey, int? localPort = null, bool wireObfuscation = true)
     {
         ProxyServer = proxyServer;
         _identityKey = identityKey;
-        _wire = WireObfuscator.Create(identityKey, weAreClient: true);
+        _wire = wireObfuscation ? WireObfuscator.Create(identityKey, weAreClient: true) : null;
         Tunnel = new UdpClient();
         Tunnel.Client.Bind(new IPEndPoint(IPAddress.Any, localPort ?? 0));
         InjectWork = new AsyncWorkQueue(Math.Clamp(Environment.ProcessorCount, 2, 8));
     }
+
+    /// <summary>
+    /// Готовит кадр к отправке в туннель: заворачивает во внешнюю маскирующую
+    /// оболочку, если она включена, иначе оставляет внутренний формат как есть.
+    /// </summary>
+    public byte[] SealFrame(byte[] frame) => _wire != null ? _wire.Wrap(frame) : frame;
 
     public void PrintBanner()
     {
@@ -74,7 +80,9 @@ public sealed class ProxySession : IDisposable
         Console.WriteLine($"Loopback-алиасы           : {(config.LoopbackAliases ? "вкл" : "выкл")}");
         Console.WriteLine($"TCP-проксирование         : {(config.TcpEnabled ? "вкл" : "выкл")}");
         Console.WriteLine("Шифрование туннеля        : ECDSA P-256 + ECDH P-256 + AES-256-GCM (сессионный ключ)");
-        Console.WriteLine("Маскировка датаграмм      : внешний AEAD-слой от ключа клиента (на проводе только случайные байты)");
+        Console.WriteLine($"Маскировка датаграмм      : {(_wire != null
+            ? "внешний AEAD-слой от ключа клиента (на проводе только случайные байты)"
+            : "ВЫКЛЮЧЕНА (кадры видны в внутреннем формате; должна совпадать с сервером)")}");
         Console.WriteLine();
     }
 
@@ -231,7 +239,7 @@ public sealed class ProxySession : IDisposable
         try
         {
             // Рукопожатие уходит в той же маскирующей оболочке, что и все кадры.
-            Tunnel.Send(_wire.Wrap(frame), ProxyServer);
+            Tunnel.Send(SealFrame(frame), ProxyServer);
         }
         catch (SocketException ex)
         {
@@ -337,15 +345,29 @@ public sealed class ProxySession : IDisposable
                 continue;
             }
 
-            // Внешний слой маскировки: без верного wire-ключа датаграмма не читается.
-            // Кадр со старой сигнатурой (C0DE без оболочки) означает устаревшую
-            // версию другой стороны.
-            if (!_wire.TryUnwrap(result.Buffer, result.Buffer.Length, out var data))
+            // Внешний слой маскировки (если включен): без верного wire-ключа
+            // датаграмма не читается. Расхождение настроек сторон даёт понятные
+            // подсказки в логе.
+            byte[] data;
+            if (_wire != null)
             {
-                if (Frame.PeekFrameType(result.Buffer, result.Buffer.Length) != null)
-                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Получен немаскированный кадр — на другой стороне старая версия ПО.");
-                Interlocked.Increment(ref Stats.BadFrames);
-                continue;
+                if (!_wire.TryUnwrap(result.Buffer, result.Buffer.Length, out data!))
+                {
+                    if (Frame.PeekFrameType(result.Buffer, result.Buffer.Length) != null)
+                        Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Получен немаскированный кадр — на сервере выключена обфускация (obfuscation=false) или старая версия ПО.");
+                    Interlocked.Increment(ref Stats.BadFrames);
+                    continue;
+                }
+            }
+            else
+            {
+                data = result.Buffer;
+                if (Frame.PeekFrameType(data, data.Length) == null)
+                {
+                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Получена датаграмма без распознаваемого кадра — на сервере включена обфускация, а у клиента она отключена (--wire-obfuscation off).");
+                    Interlocked.Increment(ref Stats.BadFrames);
+                    continue;
+                }
             }
 
             var frameType = Frame.PeekFrameType(data, data.Length);
@@ -444,7 +466,7 @@ public sealed class ProxySession : IDisposable
                     _lastPingToken = token;
 
                     var ping = Frame.EncodeControl(Frame.TypePing, token, cipher);
-                    await Tunnel.SendAsync(_wire.Wrap(ping), ProxyServer);
+                    await Tunnel.SendAsync(SealFrame(ping), ProxyServer);
                 }
             }
             catch (SocketException)

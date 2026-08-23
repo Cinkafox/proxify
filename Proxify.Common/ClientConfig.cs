@@ -48,6 +48,14 @@ public sealed class ClientConfig
     public int TcpPort { get; set; }
 
     /// <summary>
+    /// Внешняя маскировка туннеля (WireObfuscator): каждая датаграмма шифруется
+    /// wire-ключом до внутреннего протокола. По умолчанию выключена; настройка
+    /// задаётся только в конфиге сервера и должна совпадать с параметром
+    /// --wire-obfuscation клиента; по туннелю не передаётся.
+    /// </summary>
+    public bool WireObfuscation { get; set; }
+
+    /// <summary>
     /// Шифрует «доказательство» для AuthAck сессионным ключом.
     /// Открытый текст: [16] nonce клиента [1] флаги [4] gameIp [2] gamePort.
     /// </summary>

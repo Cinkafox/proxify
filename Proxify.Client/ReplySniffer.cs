@@ -26,7 +26,7 @@ public sealed class ReplySniffer : IDisposable
     private readonly UdpClient _tunnel;
     private readonly IPEndPoint _proxyServer;
     private readonly Func<TunnelCipher?> _cipherGetter;
-    private readonly WireObfuscator _wire;
+    private readonly WireObfuscator? _wire;
     private readonly TunnelStats _stats;
     private readonly CancellationToken _cancellationToken;
     private readonly byte[] _buffer = new byte[65535];
@@ -40,7 +40,7 @@ public sealed class ReplySniffer : IDisposable
         Func<TunnelCipher?> cipherGetter,
         TunnelStats stats,
         CancellationToken cancellationToken,
-        WireObfuscator wire)
+        WireObfuscator? wire)
     {
         _knownClients = knownClients;
         _gamePort = gamePort;
@@ -102,7 +102,7 @@ public sealed class ReplySniffer : IDisposable
 
             try
             {
-                _tunnel.Send(_wire.Wrap(frame), _proxyServer);
+                _tunnel.Send(_wire?.Wrap(frame) ?? frame, _proxyServer);
                 Interlocked.Increment(ref _stats.PacketsOut);
             }
             catch (SocketException ex)

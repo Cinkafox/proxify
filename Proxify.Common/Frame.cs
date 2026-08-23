@@ -428,7 +428,7 @@ public static class Frame
     }
 
     /// <summary>
-    /// Собирает кадр AUTH (рукопожатие; отправляется внутри внешней оболочки).
+    /// Собирает кадр AUTH (рукопожатие; при включённой маскировке отправляется внутри внешней оболочки).
     /// Тело: [1] версия [32] X [32] Y [16] nonce [64] подпись.
     /// </summary>
     public static byte[] EncodeAuth(
@@ -485,7 +485,7 @@ public static class Frame
     }
 
     /// <summary>
-    /// Собирает кадр AUTH_ACK (рукопожатие; отправляется внутри внешней оболочки).
+    /// Собирает кадр AUTH_ACK (рукопожатие; при включённой маскировке отправляется внутри внешней оболочки).
     /// Тело: [32] X [32] Y [N] зашифрованное «доказательство».
     /// </summary>
     public static byte[] EncodeAuthAck(ReadOnlySpan<byte> sX, ReadOnlySpan<byte> sY, ReadOnlySpan<byte> wrappedProof)

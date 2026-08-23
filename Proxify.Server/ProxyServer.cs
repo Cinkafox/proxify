@@ -49,13 +49,21 @@ public sealed class ProxyServer : IDisposable
             Console.WriteLine($"    игроки (UDP) : {client.Config.Port}");
             Console.WriteLine($"    игровой сервер: {client.Config.GameIp}:{client.Config.GamePort} (на машине B)");
             Console.WriteLine($"    TCP-проксирование: {(client.Config.TcpEnabled ? $"вкл (порт {client.Config.TcpPort})" : "выкл")}");
+            Console.WriteLine($"    маскировка туннеля: {(client.Config.WireObfuscation ? "вкл" : "выкл")}");
             Console.WriteLine($"    публичный ключ: {DescribeKey(client.Config.PublicKeyPem)}");
             Console.WriteLine($"    статус        : {(client.Cipher == null ? "ждёт авторизации" : "сессия активна")}");
         }
         Console.WriteLine();
         Console.WriteLine("Шифрование: ECDSA P-256 (аутентификация) + ECDH P-256 + HKDF-SHA256 + AES-256-GCM");
-        Console.WriteLine("Все датаграммы туннеля дополнительно закрыты внешним AEAD-слоем от ключа клиента:");
-        Console.WriteLine("на проводе нет ни сигнатуры протокола, ни открытого рукопожатия.");
+        if (Sessions.All(s => s.Client.Config.WireObfuscation))
+            Console.WriteLine("Все датаграммы туннеля дополнительно закрыты внешним AEAD-слоем от ключа клиента:");
+        else if (Sessions.Any(s => s.Client.Config.WireObfuscation))
+            Console.WriteLine("Внешний AEAD-слой включён выборочно (см. 'маскировка туннеля' по клиентам):");
+        else
+            Console.WriteLine("Внешняя маскировка туннеля ВЫКЛЮЧЕНА для всех клиентов (obfuscation=false):");
+        Console.WriteLine(Sessions.All(s => s.Client.Config.WireObfuscation)
+            ? "на проводе нет ни сигнатуры протокола, ни открытого рукопожатия."
+            : "кадры клиентов с выключенной маскировкой видны во внутреннем формате.");
         Console.WriteLine();
         Console.WriteLine("Открытые порты нужны только у машины A: игроки идут на свой UDP-порт клиента,");
         Console.WriteLine("а прокси-клиенты (машины B) сами устанавливают исходящее соединение на --tunnel-port.");
@@ -112,39 +120,63 @@ public sealed class ProxyServer : IDisposable
 
     private async Task HandleTunnelFrameAsync(IPEndPoint from, byte[] data)
     {
-        try
-        {
-            // --- Известный адрес туннеля: расшифровываем его wire-ключом ---
-            if (_active.TryGetValue(from, out var session) &&
-                session.Client.Wire.TryUnwrap(data, data.Length, out var inner))
+            try
             {
-                await session.HandleFrameAsync(from, inner);
-                return;
-            }
-
-            // --- Неизвестный адрес: допускается только рукопожатие Auth ---
-            // Опознание происходит по самой расшифровке: верный wire-ключ есть
-            // только у владельца зарегистрированного закрытого ключа.
-            foreach (var candidate in Sessions)
-            {
-                if (!candidate.Client.Wire.TryUnwrap(data, data.Length, out inner))
-                    continue;
-
-                var frameType = Frame.PeekFrameType(inner, inner.Length);
-                if (frameType != Frame.TypeAuth)
+                // --- Известный адрес туннеля ---
+                if (_active.TryGetValue(from, out var session))
                 {
-                    Interlocked.Increment(ref Stats.BadFrames);
-                    LogUnknownFrame(from);
+                    var wire = session.Client.Wire;
+                    if (wire != null)
+                    {
+                        if (!wire.TryUnwrap(data, data.Length, out var inner))
+                        {
+                            Interlocked.Increment(ref Stats.BadFrames);
+                            LogUnknownFrame(from);
+                            return;
+                        }
+                        await session.HandleFrameAsync(from, inner);
+                    }
+                    else
+                    {
+                        // Обфускация выключена: кадры приходят во внутреннем формате.
+                        await session.HandleFrameAsync(from, data);
+                    }
                     return;
                 }
 
-                HandleAuthFrame(candidate, from, inner);
-                return;
-            }
+                // --- Неизвестный адрес: допускается только рукопожатие Auth ---
+                var looksPlainAuth = Frame.PeekFrameType(data, data.Length) == Frame.TypeAuth;
+                foreach (var candidate in Sessions)
+                {
+                    byte[] inner;
+                    if (candidate.Client.Wire != null)
+                    {
+                        // Опознание по самой расшифровке: верный wire-ключ есть
+                        // только у владельца зарегистрированного закрытого ключа.
+                        if (!candidate.Client.Wire.TryUnwrap(data, data.Length, out inner))
+                            continue;
+                    }
+                    else
+                    {
+                        if (!looksPlainAuth)
+                            continue;
+                        inner = data;
+                    }
 
-            Interlocked.Increment(ref Stats.BadFrames);
-            LogUnknownFrame(from);
-        }
+                    if (Frame.PeekFrameType(inner, inner.Length) != Frame.TypeAuth)
+                    {
+                        Interlocked.Increment(ref Stats.BadFrames);
+                        LogUnknownFrame(from);
+                        return;
+                    }
+
+                    HandleAuthFrame(candidate, from, inner);
+                    return;
+                }
+
+                Interlocked.Increment(ref Stats.BadFrames);
+                LogUnknownFrame(from);
+            }
         catch (Exception ex)
         {
             Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [ошибка] {ex.Message}");

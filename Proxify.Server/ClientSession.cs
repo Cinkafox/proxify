@@ -28,7 +28,7 @@ public sealed class ClientSession : IDisposable
     /// Ключи выводятся из зарегистрированного публичного ключа, поэтому
     /// доступны сразу — ещё до рукопожатия (кадр Auth тоже приходит в оболочке).
     /// </summary>
-    public WireObfuscator Wire { get; }
+    public WireObfuscator? Wire { get; }
 
     public UdpClient Udp { get; }
     public TcpListener? TcpListener { get; }
@@ -53,7 +53,9 @@ public sealed class ClientSession : IDisposable
     {
         Config = config;
         RegisteredKey = TunnelKeys.ImportPublicPem(config.PublicKeyPem);
-        Wire = WireObfuscator.Create(RegisteredKey, weAreClient: false);
+        Wire = config.WireObfuscation
+            ? WireObfuscator.Create(RegisteredKey, weAreClient: false)
+            : null;
         Udp = new UdpClient(new IPEndPoint(IPAddress.Any, config.Port));
         if (config.TcpEnabled)
             TcpListener = new TcpListener(IPAddress.Any, config.TcpPort);
@@ -71,6 +73,12 @@ public sealed class ClientSession : IDisposable
     }
 
     public void TouchActivity() => Interlocked.Exchange(ref _lastActivityTicks, DateTime.UtcNow.Ticks);
+
+    /// <summary>
+    /// Готовит кадр к отправке в туннель: заворачивает во внешнюю маскирующую
+    /// оболочку, если она включена в конфиге, иначе оставляет как есть.
+    /// </summary>
+    public byte[] SealFrame(byte[] frame) => Wire != null ? Wire.Wrap(frame) : frame;
 
     public string DisplayName => string.IsNullOrWhiteSpace(Config.Name) ? "(без имени)" : Config.Name;
 

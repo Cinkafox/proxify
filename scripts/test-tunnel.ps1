@@ -1,4 +1,4 @@
-﻿param(
+param(
     [string]$Key = "",
     [string]$Config = "",
     [int]$TunnelPort = 5600,
@@ -8,7 +8,9 @@
     [int]$TcpPort = 27555,
     [int]$GamePort = 7777,
     [switch]$Tcp = $true,
-    [switch]$NoTcp
+    [switch]$NoTcp,
+    # Включить внешнюю маскировку туннеля (по умолчанию выключена, как в конфигах).
+    [switch]$Obfuscation
 )
 
 $ErrorActionPreference = "Stop"
@@ -99,17 +101,34 @@ function Unwrap-Data {
     }
 }
 
+function New-TestUdp {
+    # UdpClient с отключённым SIO_UDP_CONNRESET: без этого Windows бросает
+    # WSAECONNRESET в Receive, если предыдущая датаграмма получила ICMP
+    # «порт недоступен» (например, от только что убитого процесса прошлого
+    # запуска теста). На платформах, где код управления не поддерживается,
+    # просто возвращаем обычный сокет.
+    $u = New-Object System.Net.Sockets.UdpClient
+    try {
+        [void]$u.Client.IOControl(-1744830452, [byte[]]@(0, 0, 0, 0), $null)
+    } catch { }
+    return $u
+}
+
 function Receive-TunnelFrame {
-    # Принимает датаграмму, снимает внешнюю маскирующую оболочку (wire-ключ s2c)
-    # и возвращает внутренний кадр.
+    # Принимает датаграмму; при включённой маскировке снимает внешнюю оболочку
+    # (wire-ключ s2c) и возвращает внутренний кадр.
     param([System.Net.Sockets.UdpClient]$Socket, [int]$TimeoutMs, [string]$What)
     $Socket.Client.ReceiveTimeout = $TimeoutMs
     $ep = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
     $data = $Socket.Receive([ref]$ep)
-    try {
-        $inner = Unwrap-Data -Key $script:wireKeyS2C -Blob $data
-    } catch {
-        throw "${What}: получен нераспознаваемый датаграмм (не прошёл внешний AEAD-слой)"
+    if ($script:useWire) {
+        try {
+            $inner = Unwrap-Data -Key $script:wireKeyS2C -Blob $data
+        } catch {
+            throw "${What}: получен нераспознаваемый датаграмм (не прошёл внешний AEAD-слой)"
+        }
+    } else {
+        $inner = $data
     }
     if ($inner.Length -lt 3 -or $inner[0] -ne 0xC0 -or $inner[1] -ne 0xDE) {
         throw "${What}: во внутреннем кадре нет magic"
@@ -134,9 +153,10 @@ function Initialize-WireKeys {
 }
 
 function Send-TunnelFrame {
-    # Шифрует внутренний кадр внешней оболочкой (wire-ключ c2s) и отправляет серверу.
+    # При включённой маскировке шифрует внутренний кадр внешней оболочкой
+    # (wire-ключ c2s); при выключенной отправляет внутренний формат как есть.
     param([byte[]]$Inner)
-    $datagram = Wrap-Data -Key $script:wireKeyC2S -Plain $Inner
+    $datagram = if ($script:useWire) { Wrap-Data -Key $script:wireKeyC2S -Plain $Inner } else { $Inner }
     [void]$tunnel.Send($datagram, $datagram.Length, "127.0.0.1", $TunnelPort)
 }
 
@@ -315,6 +335,7 @@ $keyPem = Get-Content -LiteralPath $Key -Raw
 $identity = [System.Security.Cryptography.ECDsa]::Create()
 $identity.ImportFromPem($keyPem)
 Initialize-WireKeys -IdentityKey $identity
+$script:useWire = $Obfuscation.IsPresent
 
 $workDir = Join-Path $env:TEMP "proxify-test-$(Get-Random)"
 New-Item -ItemType Directory -Path $workDir | Out-Null
@@ -338,6 +359,7 @@ if ([string]::IsNullOrEmpty($configPath)) {
                 aliases    = $false
                 tcp        = $tcpEnabled
                 tcpPort    = $TcpPort
+                obfuscation = ($script:useWire)
             }
         )
     } | ConvertTo-Json -Depth 5
@@ -349,6 +371,7 @@ Write-Host "Конфиг сервера : $configPath"
 Write-Host "Закрытый ключ  : $Key"
 Write-Host "Порт туннеля   : $TunnelPort"
 Write-Host "Порт игроков   : $(if ([string]::IsNullOrEmpty($Config)) { $Port } else { '(из конфига)' })"
+Write-Host "Маскировка     : $(if ($script:useWire) { 'вкл (внешний AEAD-слой, -Obfuscation)' } else { 'ВЫКЛЮЧЕНА (по умолчанию)' })"
 Write-Host ""
 
 $serverLog = Join-Path $workDir "server.out.log"
@@ -378,16 +401,21 @@ try {
             $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
             try { $rng.GetBytes($badNonce) } finally { $rng.Dispose() }
             $badAuth = Build-AuthFrame -Key $badKey -Ecdh $badEcdh -Nonce $badNonce
-            # Оборачиваем Auth ключами ЧУЖОГО клиента (как делал бы реальный клиент
-            # с незарегистрированной парой): сервер не сможет расшифровать кадр.
-            $badSpki = $badKey.ExportSubjectPublicKeyInfo()
-            $badWire = [System.Security.Cryptography.HKDF]::DeriveKey(
-                [System.Security.Cryptography.HashAlgorithmName]::SHA256,
-                $badSpki, 32,
-                [Text.Encoding]::UTF8.GetBytes("proxify-wire-v2"),
-                [Text.Encoding]::UTF8.GetBytes("proxify-wire-v2-c2s"))
-            $badDatagram = Wrap-Data -Key $badWire -Plain $badAuth
-            $negTunnel = New-Object System.Net.Sockets.UdpClient
+            if ($script:useWire) {
+                # Оборачиваем Auth ключами ЧУЖОГО клиента (как делал бы реальный клиент
+                # с незарегистрированной парой): сервер не сможет расшифровать кадр.
+                $badSpki = $badKey.ExportSubjectPublicKeyInfo()
+                $badWire = [System.Security.Cryptography.HKDF]::DeriveKey(
+                    [System.Security.Cryptography.HashAlgorithmName]::SHA256,
+                    $badSpki, 32,
+                    [Text.Encoding]::UTF8.GetBytes("proxify-wire-v2"),
+                    [Text.Encoding]::UTF8.GetBytes("proxify-wire-v2-c2s"))
+                $badDatagram = Wrap-Data -Key $badWire -Plain $badAuth
+            } else {
+                # Маскировка выключена: чужой клиент шлёт открытый Auth.
+                $badDatagram = $badAuth
+            }
+            $negTunnel = New-TestUdp
             try {
                 [void]$negTunnel.Send($badDatagram, $badDatagram.Length, "127.0.0.1", $TunnelPort)
                 $negTunnel.Client.ReceiveTimeout = 1200
@@ -397,7 +425,10 @@ try {
                     [void]$negTunnel.Receive([ref]$negEp)
                     $rejected = $false
                 } catch [System.Net.Sockets.SocketException] {
-                    # таймаут — сервер не ответил, чужой клиент отвергнут
+                    # таймаут или ICMP-reset — валидного ответа сервер не дал,
+                    # чужой клиент отвергнут
+                } catch {
+                    # прочие сетевые ошибки тоже означают «ответа не было»
                 }
             }
             finally {
@@ -417,7 +448,7 @@ try {
     Write-Host "    OK: сервер отверг Auth чужого ключа."
 
     # --- 1. Рукопожатие Auth / AuthAck ---
-    $tunnel = New-Object System.Net.Sockets.UdpClient
+    $tunnel = New-TestUdp
     $nonce = New-Object byte[] 16
     $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
     try { $rng.GetBytes($nonce) } finally { $rng.Dispose() }
@@ -470,7 +501,7 @@ try {
     Write-Host "[3] PONG OK (tcp-флаг из PONG: $tcpFlag)."
 
     # --- 3. UDP: игрок -> сервер -> туннель -> игрок ---
-    $player = New-Object System.Net.Sockets.UdpClient
+    $player = New-TestUdp
     $player.Connect("127.0.0.1", $playerPort)
     $hello = [Text.Encoding]::UTF8.GetBytes("HELLO")
     [void]$player.Send($hello, $hello.Length)
