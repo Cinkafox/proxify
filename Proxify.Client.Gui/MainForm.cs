@@ -24,6 +24,11 @@ public sealed class MainForm : Form
     // --- Вкладка «Клиент» ---
     private readonly TextBox _hostBox = new();
     private readonly TextBox _tunnelPortBox = new();
+    private readonly CheckBox _wireObfuscationBox = new()
+    {
+        Text = "Внешняя маскировка (совпадать с \"obfuscation\" на сервере)",
+        AutoSize = true,
+    };
     private readonly TextBox _privateKeyBox;
     private readonly TextBox _logBox;
     private readonly Button _startButton = new() { Text = "Запустить", AutoSize = true };
@@ -158,8 +163,12 @@ public sealed class MainForm : Form
         var connectionGrid = NewFieldGrid(rows: 3);
         AddFieldRow(connectionGrid, 0, "Адрес сервера (IP или хост):", _hostBox);
         AddFieldRow(connectionGrid, 1, "Порт туннеля UDP:", _tunnelPortBox);
+        AddFieldRow(connectionGrid, 2, "Маскировка туннеля:", _wireObfuscationBox);
         
-        root.Controls.Add(NewGroup("Подключение к прокси-серверу (машина A)", connectionGrid), 0, 0);
+        var connectionGroup = NewGroup("Подключение к прокси-серверу (машина A)", connectionGrid);
+        connectionGroup.AutoSize = true;
+        connectionGroup.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+        root.Controls.Add(connectionGroup, 0, 0);
 
         // --- Закрытый ключ (отдельное поле) ---
         var keyGroupContent = new TableLayoutPanel
@@ -264,23 +273,25 @@ public sealed class MainForm : Form
         if (_running)
             return;
 
-        if (!TryBuildSession(out var proxyServer, out var identityKey, out var localPort))
+        if (!TryBuildSession(out var proxyServer, out var identityKey, out var localPort, out var wireObfuscation))
             return;
 
         SaveSettingsFromUi();
 
         SetRunning(true);
-        AppendLine($"[gui] Запуск: сервер {proxyServer}, локальный порт {(localPort?.ToString() ?? "авто")}.");
+        AppendLine($"[gui] Запуск: сервер {proxyServer}, локальный порт {(localPort?.ToString() ?? "авто")}, " +
+                   $"маскировка {(wireObfuscation ? "вкл" : "выкл")}.");
 
         _runCts = new CancellationTokenSource();
-        _ = RunSessionAsync(proxyServer, identityKey, localPort, _runCts.Token);
+        _ = RunSessionAsync(proxyServer, identityKey, localPort, wireObfuscation, _runCts.Token);
     }
 
-    private bool TryBuildSession(out IPEndPoint proxyServer, out ECDsa identityKey, out int? localPort)
+    private bool TryBuildSession(out IPEndPoint proxyServer, out ECDsa identityKey, out int? localPort, out bool wireObfuscation)
     {
         proxyServer = null!;
         identityKey = null!;
         localPort = null;
+        wireObfuscation = _wireObfuscationBox.Checked;
 
         var host = _hostBox.Text.Trim();
         var tunnelPortText = _tunnelPortBox.Text.Trim();
@@ -324,9 +335,9 @@ public sealed class MainForm : Form
         return true;
     }
 
-    private async Task RunSessionAsync(IPEndPoint proxyServer, ECDsa identityKey, int? localPort, CancellationToken token)
+    private async Task RunSessionAsync(IPEndPoint proxyServer, ECDsa identityKey, int? localPort, bool wireObfuscation, CancellationToken token)
     {
-        var session = new ProxySession(proxyServer, identityKey, localPort);
+        var session = new ProxySession(proxyServer, identityKey, localPort, wireObfuscation);
         _session = session;
 
         try
@@ -444,6 +455,7 @@ public sealed class MainForm : Form
         _stopButton.Enabled = running;
         _hostBox.ReadOnly = running;
         _tunnelPortBox.ReadOnly = running;
+        _wireObfuscationBox.Enabled = !running;
         _privateKeyBox.ReadOnly = running || _privateKeyBox.ReadOnly;
         _loadKeyButton.Enabled = !running;
         _statusLabel.Text = running ? "Статус: работает" : "Статус: остановлен";
@@ -461,6 +473,7 @@ public sealed class MainForm : Form
         var settings = GuiSettings.Load();
         _hostBox.Text = settings.ServerHost;
         _tunnelPortBox.Text = settings.TunnelPort;
+        _wireObfuscationBox.Checked = settings.WireObfuscation;
         _keyFilePath = settings.KeyFilePath;
 
         if (_keyFilePath.Length > 0 && File.Exists(_keyFilePath))
@@ -483,6 +496,7 @@ public sealed class MainForm : Form
             ServerHost = _hostBox.Text.Trim(),
             TunnelPort = _tunnelPortBox.Text.Trim(),
             KeyFilePath = _keyFilePath,
+            WireObfuscation = _wireObfuscationBox.Checked,
         }.Save();
     }
 

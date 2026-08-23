@@ -54,7 +54,7 @@ public sealed class ProxySession : IDisposable
     /// <summary>Активные IP игроков (для loopback-алиасов и очистки по таймауту).</summary>
     public ConcurrentDictionary<IPAddress, DateTime> ActiveIps { get; } = new();
 
-    public ProxySession(IPEndPoint proxyServer, ECDsa identityKey, int? localPort = null, bool wireObfuscation = true)
+    public ProxySession(IPEndPoint proxyServer, ECDsa identityKey, int? localPort = null, bool wireObfuscation = false)
     {
         ProxyServer = proxyServer;
         _identityKey = identityKey;

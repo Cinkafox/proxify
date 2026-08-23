@@ -12,6 +12,9 @@ public sealed class GuiSettings
     public string TunnelPort { get; set; } = "";
     public string KeyFilePath { get; set; } = "";
 
+    /// <summary>Внешняя маскировка туннеля (по умолчанию выключена, как в конфиге сервера).</summary>
+    public bool WireObfuscation { get; set; }
+
     private static string GetPath()
     {
         var dir = Path.Combine(
