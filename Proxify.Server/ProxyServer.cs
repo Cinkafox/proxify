@@ -54,24 +54,6 @@ public sealed class ProxyServer : IDisposable
             Console.WriteLine($"    статус        : {(client.Cipher == null ? "ждёт авторизации" : "сессия активна")}");
         }
         Console.WriteLine();
-        Console.WriteLine("Шифрование: ECDSA P-256 (аутентификация) + ECDH P-256 + HKDF-SHA256 + AES-256-GCM");
-        if (Sessions.All(s => s.Client.Config.WireObfuscation))
-            Console.WriteLine("Все датаграммы туннеля дополнительно закрыты внешним AEAD-слоем от ключа клиента:");
-        else if (Sessions.Any(s => s.Client.Config.WireObfuscation))
-            Console.WriteLine("Внешний AEAD-слой включён выборочно (см. 'маскировка туннеля' по клиентам):");
-        else
-            Console.WriteLine("Внешняя маскировка туннеля ВЫКЛЮЧЕНА для всех клиентов (obfuscation=false):");
-        Console.WriteLine(Sessions.All(s => s.Client.Config.WireObfuscation)
-            ? "на проводе нет ни сигнатуры протокола, ни открытого рукопожатия."
-            : "кадры клиентов с выключенной маскировкой видны во внутреннем формате.");
-        Console.WriteLine();
-        Console.WriteLine("Открытые порты нужны только у машины A: игроки идут на свой UDP-порт клиента,");
-        Console.WriteLine("а прокси-клиенты (машины B) сами устанавливают исходящее соединение на --tunnel-port.");
-        Console.WriteLine("На машине B открывать порты не требуется.");
-        Console.WriteLine();
-        Console.WriteLine("Сервер принимает только авторизованных клиентов: подпись кадра Auth проверяется");
-        Console.WriteLine("зарегистрированным публичным ключом. Каждый клиент получает свою сессию.");
-        Console.WriteLine();
         Console.WriteLine("Ожидание кадров от прокси-клиентов...");
         Console.WriteLine();
     }
