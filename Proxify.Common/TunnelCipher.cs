@@ -16,6 +16,9 @@ public sealed class TunnelCipher
     public const int NonceSize = 12;
     public const int TagSize = 16;
 
+    /// <summary>Суммарный оверхед зашифрованного блока (nonce + tag).</summary>
+    public const int Overhead = NonceSize + TagSize;
+
     private static readonly RandomNumberGenerator Rng = RandomNumberGenerator.Create();
 
     private readonly byte[] _key;

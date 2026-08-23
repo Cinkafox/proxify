@@ -20,7 +20,8 @@ public sealed class ProxySession : IDisposable
 {
     private static readonly TimeSpan AuthAttemptTimeout = TimeSpan.FromSeconds(3);
     private static readonly TimeSpan ReauthTimeout = TimeSpan.FromSeconds(30);
-    private static readonly TimeSpan HeartbeatInterval = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan HeartbeatMinInterval = TimeSpan.FromSeconds(7);
+    private static readonly TimeSpan HeartbeatMaxInterval = TimeSpan.FromSeconds(15);
 
     private readonly ECDsa _identityKey;
     private readonly WireObfuscator _wire;
@@ -30,6 +31,7 @@ public sealed class ProxySession : IDisposable
     private byte[]? _pendingNonce;
     private TaskCompletionSource<bool>? _authTcs;
     private long _lastPongTicks;
+    private byte[] _lastPingToken = Array.Empty<byte>();
     private LoopbackAliasManager? _aliases;
     private RawInjector? _injector;
     private TcpRelay? _tcpRelay;
@@ -366,7 +368,7 @@ public sealed class ProxySession : IDisposable
             if (frameType == Frame.TypePong)
             {
                 // Сервер каждым PONG сообщает, включено ли у него TCP-проксирование.
-                if (Frame.TryDecodePong(data, data.Length, cipher, 16, out _, out var tcpFlag))
+                if (Frame.TryDecodePong(data, data.Length, cipher, _lastPingToken.Length, out _, out var tcpFlag))
                 {
                     Interlocked.Exchange(ref _lastPongTicks, DateTime.UtcNow.Ticks);
                     ServerTcp.Set(tcpFlag);
@@ -422,9 +424,11 @@ public sealed class ProxySession : IDisposable
     }
 
     /// <summary>
-    /// Сердцебиение: раз в 10 секунд отправляет прокси-серверу PING. Сервер по нему
-    /// держит сессию живой. Если PONG давно не было (30 с) — сессия протухла:
-    /// выполняем повторную авторизацию (новый Auth/AuthAck и сессионный ключ).
+    /// Сердцебиение: отправляет прокси-серверу PING через случайный интервал
+    /// (7–15 с) с маркером случайной длины. Нерегулярные интервалы и размер
+    /// делают служебный трафик неотличимым от данных. Если PONG давно не было
+    /// (30 с) — сессия протухла: выполняем повторную авторизацию
+    /// (новый Auth/AuthAck и сессионный ключ).
     /// </summary>
     private async Task HeartbeatLoop(CancellationToken ct)
     {
@@ -435,7 +439,11 @@ public sealed class ProxySession : IDisposable
                 var cipher = Cipher;
                 if (cipher != null)
                 {
-                    var ping = Frame.EncodeControl(Frame.TypePing, Guid.NewGuid().ToByteArray(), cipher);
+                    var token = new byte[16 + Random.Shared.Next(49)];
+                    Random.Shared.NextBytes(token);
+                    _lastPingToken = token;
+
+                    var ping = Frame.EncodeControl(Frame.TypePing, token, cipher);
                     await Tunnel.SendAsync(_wire.Wrap(ping), ProxyServer);
                 }
             }
@@ -458,7 +466,9 @@ public sealed class ProxySession : IDisposable
 
             try
             {
-                await Task.Delay(HeartbeatInterval, ct);
+                var delay = HeartbeatMinInterval.TotalMilliseconds +
+                            Random.Shared.NextDouble() * (HeartbeatMaxInterval - HeartbeatMinInterval).TotalMilliseconds;
+                await Task.Delay(TimeSpan.FromMilliseconds(delay), ct);
             }
             catch (OperationCanceledException)
             {

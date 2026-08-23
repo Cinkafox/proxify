@@ -165,19 +165,49 @@ public static class Frame
     /// <summary>
     /// Собирает служебный кадр (PING/PONG). Тело кадра при заданном cipher шифруется.
     /// </summary>
+    /// <summary>
+    /// Собирает служебный кадр (PING/PONG, TCP-релей). Тело перед шифрованием
+    /// дополняется случайным паддингом, чтобы размер датаграммы не выдавал тип
+    /// кадра и содержимое. Формат зашифрованного тела:
+    ///   [2] длина полезного тела (big endian) [M] тело [pad] случайные байты.
+    /// Итоговая длина кадра округляется вверх до «ведра» <see cref="PaddingBucket"/>
+    /// байт со случайным добором; у крупных кадров паддинг может отсутствовать
+    /// (ограничение MTU). Принимающая сторона читает тело по явной длине,
+    /// паддинг отбрасывается.
+    /// </summary>
+    public const int PaddingBucket = 64;
+
+    /// <summary>Верхний предел итогового кадра с учётом паддинга.</summary>
+    private const int MaxControlFrameLength = 1440;
+
     public static byte[] EncodeControl(byte type, byte[] payload, TunnelCipher? cipher)
     {
-        var body = cipher != null ? cipher.Wrap(payload) : payload;
-        var frame = new byte[HeaderLength + body.Length];
+        var envelopeOverhead = cipher != null ? TunnelCipher.Overhead : 0;
+        var baseLength = HeaderLength + envelopeOverhead + 2 + payload.Length;
+
+        var total = ((baseLength / PaddingBucket) + 1) * PaddingBucket;
+        total += Random.Shared.Next(PaddingBucket / 2);
+        if (total > MaxControlFrameLength || total <= baseLength)
+            total = baseLength;
+
+        var body = new byte[2 + payload.Length + (total - baseLength)];
+        Random.Shared.NextBytes(body.AsSpan(2 + payload.Length));
+
         var o = 0;
+        WriteU16(body, ref o, (ushort)payload.Length);
+        payload.CopyTo(body.AsSpan(o));
+
+        var wrapped = cipher != null ? cipher.Wrap(body) : body;
+        var frame = new byte[HeaderLength + wrapped.Length];
+        o = 0;
         WriteU16(frame, ref o, Magic);
         frame[o++] = type;
-        body.CopyTo(frame.AsSpan(o));
+        wrapped.CopyTo(frame.AsSpan(o));
         return frame;
     }
 
     /// <summary>
-    /// Разбирает служебный кадр (PING/PONG) и возвращает его тело (маркер).
+    /// Разбирает служебный кадр и возвращает его полезное тело (без паддинга).
     /// Возвращает false, если кадр не того типа, имеет неверный magic или
     /// не прошёл расшифровку (например, несовпадение ключа).
     /// </summary>
@@ -195,15 +225,27 @@ public static class Frame
         if (buffer[o++] != expectedType)
             return false;
 
-        var body = buffer.AsSpan(o, length - o);
-
+        byte[] body;
         if (cipher == null)
         {
-            payload = body.ToArray();
-            return true;
+            body = buffer.AsSpan(o, length - o).ToArray();
+        }
+        else if (!cipher.TryUnwrap(buffer.AsSpan(o, length - o), out body))
+        {
+            return false;
         }
 
-        return cipher.TryUnwrap(body, out payload);
+        if (body.Length < 2)
+            return false;
+
+        var p = 0;
+        var payloadLength = ReadU16(body, ref p);
+        if (payloadLength > body.Length - p)
+            return false;
+
+        payload = new byte[payloadLength];
+        Array.Copy(body, p, payload, 0, payloadLength);
+        return true;
     }
 
     /// <summary>

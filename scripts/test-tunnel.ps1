@@ -229,12 +229,20 @@ function Decode-DataFrame {
 }
 
 function Build-ControlFrame {
+    # Тело кадра: [2] длина полезного тела [M] тело [pad] случайный добор.
+    # Итоговый размер датаграммы не выдаёт тип и содержимое кадра.
     param([int]$Type, [byte[]]$Body, [byte[]]$Key)
-    $blob = Wrap-Data -Key $Key -Plain $Body
+    $pad = New-Object byte[] (Get-Random -Minimum 0 -Maximum 32)
+    ([System.Security.Cryptography.RandomNumberGenerator]::Create()).GetBytes($pad)
+    $lenHi = [byte](($Body.Length -shr 8) -band 0xFF)
+    $lenLo = [byte]($Body.Length -band 0xFF)
+    $plain = Concat-Bytes @([byte[]]@($lenHi, $lenLo), $Body, $pad)
+    $blob = Wrap-Data -Key $Key -Plain $plain
     return , (Concat-Bytes @([byte[]]@(0xC0, 0xDE, [byte]$Type), $blob))
 }
 
 function Decode-EncryptedBody {
+    # Расшифровывает тело служебного кадра и отрезает паддинг по явной длине.
     param([byte[]]$Frame, [byte[]]$Key, [int]$ExpectedType)
     if ($Frame.Length -lt 3) { throw "Кадр слишком короткий" }
     $type = $Frame[2]
@@ -243,7 +251,13 @@ function Decode-EncryptedBody {
     }
     $blob = New-Object byte[] ($Frame.Length - 3)
     [Array]::Copy($Frame, 3, $blob, 0, $blob.Length)
-    return Unwrap-Data -Key $Key -Blob $blob
+    $dec = Unwrap-Data -Key $Key -Blob $blob
+    if ($dec.Length -lt 2) { throw "Тело кадра короче заголовка длины" }
+    $payloadLen = ([uint16]$dec[0] -shl 8) -bor [uint16]$dec[1]
+    if ($payloadLen -gt ($dec.Length - 2)) { throw "Длина тела превышает размер кадра" }
+    $body = New-Object byte[] $payloadLen
+    [Array]::Copy($dec, 2, $body, 0, $payloadLen)
+    return ,$body
 }
 
 function Build-TcpDataFrame {
@@ -438,18 +452,21 @@ try {
     Write-Host "    OK: конфиг от сервера получен и расшифрован."
 
     # --- 2. PING / PONG ---
-    $pingToken = New-Object byte[] 16
+    # Маркер случайной длины (16..64 байта) — как в клиенте: размер и интервал
+    # служебных кадров не должны быть постоянными.
+    $tokenLen = 16 + (Get-Random -Minimum 0 -Maximum 49)
+    $pingToken = New-Object byte[] $tokenLen
     $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
     try { $rng.GetBytes($pingToken) } finally { $rng.Dispose() }
     $ping = Build-ControlFrame -Type 3 -Body $pingToken -Key $sessionKey
     Send-TunnelFrame -Inner $ping
     $pong = Receive-TunnelFrame -Socket $tunnel -TimeoutMs 3000 -What "PONG"
     $pongBody = Decode-EncryptedBody -Frame $pong -Key $sessionKey -ExpectedType 4
-    if ($pongBody.Length -ne 17) { throw "Неверный формат PONG" }
-    for ($i = 0; $i -lt 16; $i++) {
+    if ($pongBody.Length -ne ($tokenLen + 1)) { throw "Неверный формат PONG ($($pongBody.Length) байт, ожидалось $($tokenLen + 1))" }
+    for ($i = 0; $i -lt $tokenLen; $i++) {
         if ($pongBody[$i] -ne $pingToken[$i]) { throw "Маркер PONG не совпадает с PING" }
     }
-    $tcpFlag = $pongBody[16] -eq 1
+    $tcpFlag = $pongBody[$tokenLen] -eq 1
     Write-Host "[3] PONG OK (tcp-флаг из PONG: $tcpFlag)."
 
     # --- 3. UDP: игрок -> сервер -> туннель -> игрок ---
