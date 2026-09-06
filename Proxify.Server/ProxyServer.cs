@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading.Channels;
@@ -14,12 +13,16 @@ namespace Proxify.Server;
 /// Все датаграммы приходят во внешней маскирующей оболочке (WireObfuscator): ключ
 /// выводится из зарегистрированного публичного ключа клиента, поэтому расшифровать
 /// кадр может только владелец соответствующего закрытого ключа. Расшифровка и
-/// служит опознанием клиента; кадр Auth принимается только от ещё не
-/// авторизованных адресов.
+/// служит опознанием клиента.
+///
+/// Клиент опознаётся по своей криптографической личности (wire-ключу / подписи
+/// кадра Auth), а не по исходному IP-адресу. Это позволяет обслуживать несколько
+/// клиентов за одним адресом или NAT и не сбрасывает сессию при смене исходного
+/// порта (повторное подключение): для каждого кадра сервер подбирает сессию,
+/// чей wire-ключ успешно расшифровал датаграмму.
 /// </summary>
 public sealed class ProxyServer : IDisposable
 {
-    private readonly ConcurrentDictionary<IPEndPoint, ProxySession> _active = new();
     private long _lastUnknownLogTicks;
 
     public int TunnelPort { get; }
@@ -102,63 +105,49 @@ public sealed class ProxyServer : IDisposable
 
     private async Task HandleTunnelFrameAsync(IPEndPoint from, byte[] data)
     {
-            try
+        try
+        {
+            foreach (var candidate in Sessions)
             {
-                // --- Известный адрес туннеля ---
-                if (_active.TryGetValue(from, out var session))
+                byte[] inner;
+                var isKnownEndpoint = candidate.Client.TunnelEndpoint?.Equals(from) == true;
+
+                if (candidate.Client.Wire != null)
                 {
-                    var wire = session.Client.Wire;
-                    if (wire != null)
+                    if (!candidate.Client.Wire.TryUnwrap(data, data.Length, out inner))
+                        continue;
+                }
+                else
+                {
+                    if (!isKnownEndpoint &&
+                        Frame.PeekFrameType(data, data.Length) != Frame.TypeAuth)
                     {
-                        if (!wire.TryUnwrap(data, data.Length, out var inner))
-                        {
-                            Interlocked.Increment(ref Stats.BadFrames);
-                            LogUnknownFrame(from);
-                            return;
-                        }
-                        await session.HandleFrameAsync(from, inner);
+                        continue;
                     }
-                    else
-                    {
-                        // Обфускация выключена: кадры приходят во внутреннем формате.
-                        await session.HandleFrameAsync(from, data);
-                    }
-                    return;
+                    inner = data;
                 }
 
-                // --- Неизвестный адрес: допускается только рукопожатие Auth ---
-                var looksPlainAuth = Frame.PeekFrameType(data, data.Length) == Frame.TypeAuth;
-                foreach (var candidate in Sessions)
+                var frameType = Frame.PeekFrameType(inner, inner.Length);
+                if (frameType != Frame.TypeAuth)
                 {
-                    byte[] inner;
-                    if (candidate.Client.Wire != null)
+                    if (candidate.Client.Cipher != null)
                     {
-                        // Опознание по самой расшифровке: верный wire-ключ есть
-                        // только у владельца зарегистрированного закрытого ключа.
-                        if (!candidate.Client.Wire.TryUnwrap(data, data.Length, out inner))
-                            continue;
-                    }
-                    else
-                    {
-                        if (!looksPlainAuth)
-                            continue;
-                        inner = data;
-                    }
-
-                    if (Frame.PeekFrameType(inner, inner.Length) != Frame.TypeAuth)
-                    {
-                        Interlocked.Increment(ref Stats.BadFrames);
-                        LogUnknownFrame(from);
+                        await candidate.HandleFrameAsync(from, inner);
                         return;
                     }
 
-                    HandleAuthFrame(candidate, from, inner);
+                    Interlocked.Increment(ref Stats.BadFrames);
+                    LogUnknownFrame(from);
                     return;
                 }
 
-                Interlocked.Increment(ref Stats.BadFrames);
-                LogUnknownFrame(from);
+                HandleAuthFrame(candidate, from, inner);
+                return;
             }
+
+            Interlocked.Increment(ref Stats.BadFrames);
+            LogUnknownFrame(from);
+        }
         catch (Exception ex)
         {
             Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [ошибка] {ex.Message}");
@@ -168,7 +157,7 @@ public sealed class ProxyServer : IDisposable
     /// <summary>
     /// Разбирает и проверяет кадр Auth, расшифрованный wire-ключом кандидата.
     /// Подпись ECDSA подтверждает владение закрытым ключом; при успехе сессия
-    /// активируется и привязывается к адресу отправителя.
+    /// активируется и запоминает текущий адрес отправителя для обратной отправки.
     /// </summary>
     private void HandleAuthFrame(ProxySession candidate, IPEndPoint from, byte[] inner)
     {
@@ -193,8 +182,6 @@ public sealed class ProxyServer : IDisposable
             Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Auth от {from}: подпись не соответствует зарегистрированному ключу клиента '{candidate.Client.DisplayName}'.");
             return;
         }
-
-        _active[from] = candidate;
     }
 
     private void LogUnknownFrame(IPEndPoint from)
