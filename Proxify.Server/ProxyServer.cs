@@ -135,14 +135,12 @@ public sealed class ProxyServer : IDisposable
                         await candidate.HandleFrameAsync(from, inner);
                         return;
                     }
-
-                    Interlocked.Increment(ref Stats.BadFrames);
-                    LogUnknownFrame(from);
-                    return;
+                    
+                    continue;
                 }
-
-                HandleAuthFrame(candidate, from, inner);
-                return;
+                
+                if (HandleAuthFrame(candidate, from, inner))
+                    return;
             }
 
             Interlocked.Increment(ref Stats.BadFrames);
@@ -158,21 +156,23 @@ public sealed class ProxyServer : IDisposable
     /// Разбирает и проверяет кадр Auth, расшифрованный wire-ключом кандидата.
     /// Подпись ECDSA подтверждает владение закрытым ключом; при успехе сессия
     /// активируется и запоминает текущий адрес отправителя для обратной отправки.
+    /// Возвращает true, если кадр успешно принят этим кандидатом; false — кандидат
+    /// не совпал (подпись не его), и перебор стоит продолжить.
     /// </summary>
-    private void HandleAuthFrame(ProxySession candidate, IPEndPoint from, byte[] inner)
+    private bool HandleAuthFrame(ProxySession candidate, IPEndPoint from, byte[] inner)
     {
         if (!Frame.TryDecodeAuth(inner, inner.Length, out var version, out var ephX, out var ephY, out var nonce, out var signature))
         {
             Interlocked.Increment(ref Stats.BadFrames);
             Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Не удалось разобрать кадр Auth от {from}.");
-            return;
+            return false;
         }
 
         if (version != TunnelKeys.AuthVersion)
         {
             Interlocked.Increment(ref Stats.BadFrames);
             Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Auth от {from} с неизвестной версией {version}.");
-            return;
+            return false;
         }
 
         var payload = TunnelKeys.BuildAuthPayload(ephX, ephY, nonce);
@@ -180,8 +180,10 @@ public sealed class ProxyServer : IDisposable
         {
             Interlocked.Increment(ref Stats.BadFrames);
             Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Auth от {from}: подпись не соответствует зарегистрированному ключу клиента '{candidate.Client.DisplayName}'.");
-            return;
+            return false;
         }
+
+        return true;
     }
 
     private void LogUnknownFrame(IPEndPoint from)
