@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using Proxify.Client.Gui;
+using Proxify.Client.Gui.Support;
 
 ApplicationConfiguration.Initialize();
 

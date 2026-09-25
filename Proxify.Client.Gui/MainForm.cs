@@ -3,7 +3,11 @@ using System.Net;
 using System.Net.Sockets;
 using System.Security.Cryptography;
 using Proxify.Client;
+using Proxify.Client.Gui.Support;
+using Proxify.Client.Sessions;
 using Proxify.Common;
+using Proxify.Common.Crypto;
+using Proxify.Common.Networking;
 
 namespace Proxify.Client.Gui;
 
@@ -337,7 +341,23 @@ public sealed class MainForm : Form
 
     private async Task RunSessionAsync(IPEndPoint proxyServer, ECDsa identityKey, int? localPort, bool wireObfuscation, CancellationToken token)
     {
-        var session = new ProxySession(proxyServer, identityKey, localPort, wireObfuscation);
+        ProxySession? session;
+        try
+        {
+            session = await ProxySession.CreateAsync(proxyServer, identityKey, localPort, wireObfuscation);
+        }
+        catch (Exception ex)
+        {
+            AppendLine($"[!] Не удалось создать сессию: {ex.Message}");
+            return;
+        }
+
+        if (session == null)
+        {
+            AppendLine("[!] Авторизация не удалась — смотрите лог в консоли.");
+            return;
+        }
+
         _session = session;
 
         try
