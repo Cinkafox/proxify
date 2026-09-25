@@ -5,9 +5,9 @@ using Proxify.Server;
 Console.OutputEncoding = Encoding.UTF8;
 
 var cli = new ArgParser("Proxify.Server")
-    .Add("config", "Путь к JSON-конфигу с клиентами (порт, публичный ключ, игровые параметры)", shortName: 'c')
+    .Add("config", "Путь к YAML-конфигу с правилами (порт/протокол, публичный ключ, игровые параметры)", shortName: 'c')
     .Add("tunnel-port", "UDP-порт туннеля, на который прокси-клиенты (машина B) шлют кадры", shortName: 't')
-    .Add("configgen", "Сгенерировать шаблон server.json из client-public.pem в указанном каталоге и выйти", shortName: 'g');
+    .Add("configgen", "Сгенерировать шаблон server.yml из client-public.pem в указанном каталоге и выйти", shortName: 'g');
 
 if (!cli.TryParse(args))
 {
@@ -53,7 +53,7 @@ if (!ServerConfig.TryLoad(configPath, out var clients, out var configError))
 
 foreach (var client in clients)
 {
-    if (tunnelPort == client.Port || (client.TcpEnabled && tunnelPort == client.TcpPort))
+    if (tunnelPort == client.Port)
     {
         Console.WriteLine($"[ошибка конфигурации] '--tunnel-port {tunnelPort}' совпадает с портом клиента '{client.DisplayName()}' — конфликт.");
         return 1;

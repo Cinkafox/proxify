@@ -4,11 +4,12 @@
 #   node-a — публичный прокси-сервер (машина A)
 #   node-b — прокси-клиент + игровой UDP-сервер (машина B)
 #
-# Перед запуском (один раз):
-#   Proxify.Client --keygen ./deploy/            # пара ключей
-#   Proxify.Server --configgen ./deploy/         # server.json (использует
+# Перед запуском (один раз): каждое правило конфига = отдельный прокси-клиент
+# со своей парой ключей (UDP и TCP — раздельно).
+#   Proxify.Client --keygen ./deploy/            # пара ключей (для UDP-правила)
+#   Proxify.Server --configgen ./deploy/         # server.yml (использует
 #                                                # client-public.pem в ./deploy/)
-#   При необходимости отредактируйте ./deploy/server.json (порт игроков и т.п.).
+#   При необходимости отредактируйте ./deploy/server.yml (порт игроков и т.п.).
 #
 # Запуск:
 #   docker compose -f docker-compose.local.yml up -d --build
@@ -37,11 +38,11 @@ services:
     command:
       # --config [путь к конфигу в контейнере] --tunnel-port [порт туннеля]
       - "--config"
-      - "/app/server.json"
+      - "/app/server.yml"
       - "--tunnel-port"
       - "5600"
     volumes:
-      - "${SERVER_CONFIG:-./deploy/server.json}:/app/server.json:ro"
+      - "${SERVER_CONFIG:-./deploy/server.yml}:/app/server.yml:ro"
       - "${CLIENT_PUBLIC_KEY:-./deploy/client-public.pem}:/app/client-public.pem:ro"
     ports:
       - "27015:27015/udp"       # сюда подключаются игроки

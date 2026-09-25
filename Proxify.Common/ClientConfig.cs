@@ -5,14 +5,17 @@ namespace Proxify.Common;
 /// <summary>
 /// Конфигурация одного прокси-клиента (машина B).
 ///
-/// Полная конфигурация задаётся в JSON-конфиге прокси-сервера (машина A):
-/// сервер слушает на порту <see cref="Port"/> пакеты игроков, знает адрес
-/// игрового сервера машины B и пересылает клиенту нужные параметры кадром
-/// AuthAck. Клиент хранит только адрес сервера и свой закрытый ключ.
+/// Полная конфигурация задаётся в YAML-конфиге прокси-сервера (машина A): каждый
+/// блок конфига — отдельный клиент, ключ правила задаёт протокол и порты
+/// (<see cref="Port"/>, <see cref="GamePort"/>, <see cref="TcpEnabled"/>). Сервер
+/// слушает на порту <see cref="Port"/> пакеты игроков (UDP) или TCP-подключения
+/// (<see cref="TcpEnabled"/>), знает адрес игрового сервера машины B и пересылает
+/// клиенту нужные параметры кадром AuthAck. Клиент хранит только адрес сервера
+/// и свой закрытый ключ.
 ///
 /// По туннелю (в «доказательстве» AuthAck) передаётся только та часть, которая
 /// нужна клиенту: gameIp, gamePort, флаги capture/aliases/tcp. Не передаются
-/// <see cref="Port"/>/<see cref="TcpPort"/> (это порты сервера) и публичный ключ.
+/// <see cref="Port"/> (это порт сервера) и публичный ключ.
 /// </summary>
 public sealed class ClientConfig
 {
@@ -26,13 +29,13 @@ public sealed class ClientConfig
     /// <summary>Публичный ключ клиента (SPKI PEM); только на сервере.</summary>
     public string PublicKeyPem { get; set; } = "";
 
-    /// <summary>UDP-порт на машине A, на который подключаются игроки этого клиента.</summary>
+    /// <summary>Порт на машине A, на который подключаются игроки этого клиента (UDP или TCP).</summary>
     public int Port { get; set; }
 
     /// <summary>IP игрового сервера на машине B (видимый прокси-клиенту).</summary>
     public IPAddress GameIp { get; set; } = IPAddress.Any;
 
-    /// <summary>UDP-порт игрового сервера на машине B.</summary>
+    /// <summary>UDP- или TCP-порт игрового сервера на машине B.</summary>
     public ushort GamePort { get; set; }
 
     /// <summary>Перехватывать ответы игрового сервера (raw-сниффер) на машине B.</summary>
@@ -41,11 +44,13 @@ public sealed class ClientConfig
     /// <summary>Добавлять IP игроков в loopback-алиасы на машине B.</summary>
     public bool LoopbackAliases { get; set; } = true;
 
-    /// <summary>Включено ли TCP-проксирование для этого клиента.</summary>
+    /// <summary>
+    /// Протокол правила: <c>true</c> — TCP-проксирование (публичный порт
+    /// <see cref="Port"/> на машине A открывается по TCP, игровой <see cref="GamePort"/>
+    /// тоже TCP); <c>false</c> — UDP-проксирование с подменой реального IP.
+    /// TCP и UDP разделены: каждое правило конфига — отдельный клиент.
+    /// </summary>
     public bool TcpEnabled { get; set; }
-
-    /// <summary>TCP-порт на машине A для реальных TCP-клиентов (по умолчанию = Port).</summary>
-    public int TcpPort { get; set; }
 
     /// <summary>
     /// Внешняя маскировка туннеля (WireObfuscator): каждая датаграмма шифруется
@@ -58,6 +63,7 @@ public sealed class ClientConfig
     /// <summary>
     /// Шифрует «доказательство» для AuthAck сессионным ключом.
     /// Открытый текст: [16] nonce клиента [1] флаги [4] gameIp [2] gamePort.
+    /// Для TCP-клиента (флаг 0x04) gameIp/gamePort — адрес TCP-игрового сервера.
     /// </summary>
     public byte[] EncodeProof(byte[] clientNonce, TunnelCipher cipher)
     {

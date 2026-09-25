@@ -1,20 +1,22 @@
 # ============================================================================
 # ПРИМЕР 2A: машина A — публичный прокси-сервер (реальный сценарий, 2 машины).
 #
-# Перед запуском (ключи и конфиг):
+# Перед запуском (ключи и конфиг): каждое правило конфига = отдельный
+# прокси-клиент (TCP и UDP — раздельно) со своей парой ключей.
 #   На машине B:  Proxify.Client --keygen <dir>      # создаёт client-private.pem,
 #                                                    # client-public.pem
 #   Скопируйте client-public.pem на машину A в ./deploy/ и сгенерируйте конфиг:
 #   На машине A:  Proxify.Server --configgen ./deploy/
-#                 (или создайте ./deploy/server.json вручную — см. README)
-#   Если клиентов несколько — добавьте их в server.json.
+#                 (или создайте ./deploy/server.yml вручную — см. README)
+#   Если клиентов несколько — добавьте их в server.yml (нельзя дублировать
+#   публичный ключ: на каждый ключ — своё правило/свой клиент).
 #
 # Запуск НА машине A:
 #   docker compose -f docker-compose.machine-a.yml up -d --build
 #
 # Публичные порты 27015/udp (игроки) и 5600/udp (туннель) открыты на машине A —
 # на машине B открывать порты не нужно. Адрес машины B сервер узнаёт по первому
-# кадру Auth/PING. Файл конфига монтируется в /app/server.json, публичные ключи
+# кадру Auth/PING. Файл конфига монтируется в /app/server.yml, публичные ключи
 # резолвятся относительно него (publicKey: "client-public.pem" -> /app/client-public.pem).
 # ============================================================================
 
@@ -26,11 +28,11 @@ services:
     command:
       # --config [путь к конфигу в контейнере] --tunnel-port [порт туннеля]
       - "--config"
-      - "/app/server.json"
+      - "/app/server.yml"
       - "--tunnel-port"
       - "5600"
     volumes:
-      - "${SERVER_CONFIG:-./deploy/server.json}:/app/server.json:ro"
+      - "${SERVER_CONFIG:-./deploy/server.yml}:/app/server.yml:ro"
       - "${CLIENT_PUBLIC_KEY:-./deploy/client-public.pem}:/app/client-public.pem:ro"
     ports:
       - "27015:27015/udp"       # для игроков

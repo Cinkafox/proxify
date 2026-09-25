@@ -9,10 +9,15 @@ namespace Proxify.Server;
 /// <summary>
 /// Данные одного зарегистрированного прокси-клиента на прокси-сервере (машина A).
 ///
-/// Хранит только состояние: конфиг из server.json, зарегистрированный публичный
-/// ключ, UDP-сокет игроков (порт <see cref="ClientConfig.Port"/>), опциональный
-/// TCP-прослушиватель и активную сессию туннеля (адрес клиента + сессионный ключ).
-/// Обработкой кадров и пакетов занимается <see cref="ProxySession"/>.
+/// Хранит только состояние: конфиг из server.yml, зарегистрированный публичный
+/// ключ, сокет игроков (UDP — порт <see cref="ClientConfig.Port"/> для UDP-правила,
+/// либо TCP-прослушиватель для TCP-правила) и активную сессию туннеля (адрес
+/// клиента + сессионный ключ). Обработкой кадров и пакетов занимается
+/// <see cref="ProxySession"/>.
+///
+/// TCP и UDP разделены конфигом: клиент — либо UDP-правило (с подменой реального
+/// IP), либо TCP-правило. Для UDP-клиента создаётся <see cref="Udp"/>, для
+/// TCP-клиента — <see cref="TcpListener"/> на том же <see cref="ClientConfig.Port"/>.
 /// </summary>
 public sealed class ClientSession : IDisposable
 {
@@ -30,7 +35,10 @@ public sealed class ClientSession : IDisposable
     /// </summary>
     public WireObfuscator? Wire { get; }
 
-    public UdpClient Udp { get; }
+    /// <summary>UDP-сокет игроков (только для UDP-правила; у TCP-клиента null).</summary>
+    public UdpClient? Udp { get; }
+
+    /// <summary>TCP-прослушиватель игроков (только для TCP-правила; у UDP-клиента null).</summary>
     public TcpListener? TcpListener { get; }
 
     /// <summary>TCP-соединения реальных клиентов: connId -> сокет.</summary>
@@ -56,9 +64,10 @@ public sealed class ClientSession : IDisposable
         Wire = config.WireObfuscation
             ? WireObfuscator.Create(RegisteredKey, weAreClient: false)
             : null;
-        Udp = new UdpClient(new IPEndPoint(IPAddress.Any, config.Port));
         if (config.TcpEnabled)
-            TcpListener = new TcpListener(IPAddress.Any, config.TcpPort);
+            TcpListener = new TcpListener(IPAddress.Any, config.Port);
+        else
+            Udp = new UdpClient(new IPEndPoint(IPAddress.Any, config.Port));
     }
 
     /// <summary>
@@ -85,7 +94,7 @@ public sealed class ClientSession : IDisposable
     public void Dispose()
     {
         RegisteredKey.Dispose();
-        Udp.Dispose();
+        Udp?.Dispose();
         TcpListener?.Stop();
         foreach (var client in TcpClients.Values)
             client.Close();

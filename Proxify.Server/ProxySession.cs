@@ -188,10 +188,17 @@ public sealed class ProxySession : IDisposable
             if (Frame.TryDecodeData(data, data.Length, cipher, out var clientIp, out var clientPort, out var payload))
             {
                 _client.TouchActivity();
+                var udp = _client.Udp;
+                if (udp == null)
+                {
+                    // TCP-клиент: кадры данных с ответами не ожидаются — игнорируем.
+                    Interlocked.Increment(ref _stats.BadFrames);
+                    return;
+                }
                 var target = new IPEndPoint(clientIp, clientPort);
                 Interlocked.Increment(ref _stats.PacketsIn);
                 Interlocked.Increment(ref _stats.RepliesRelayed);
-                await _client.Udp.SendAsync(payload, target);
+                await udp.SendAsync(payload, target);
             }
             else
             {
@@ -207,6 +214,7 @@ public sealed class ProxySession : IDisposable
 
     /// <summary>
     /// Цикл приёма пакетов игроков (UDP-порт игроков этого клиента).
+    /// Запускается только для UDP-правил (<paramref name="TcpEnabled"/> == false).
     /// </summary>
     public async Task PlayerLoopAsync()
     {
@@ -215,7 +223,7 @@ public sealed class ProxySession : IDisposable
             UdpReceiveResult result;
             try
             {
-                result = await _client.Udp.ReceiveAsync();
+                result = await _client.Udp!.ReceiveAsync();
             }
             catch (SocketException ex)
             {
@@ -271,12 +279,12 @@ public sealed class ProxySession : IDisposable
     }
 
     /// <summary>
-    /// Цикл приёма TCP-подключений игроков (если включено в конфиге клиента).
+    /// Цикл приёма TCP-подключений игроков (только для TCP-правил конфига).
     /// </summary>
     public async Task TcpLoopAsync()
     {
         _client.TcpListener!.Start();
-        Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [tcp] Клиент '{_client.DisplayName}': слушаем TCP-порт игроков {_client.Config.TcpPort}.");
+        Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [tcp] Клиент '{_client.DisplayName}': слушаем TCP-порт игроков {_client.Config.Port}.");
 
         while (true)
         {

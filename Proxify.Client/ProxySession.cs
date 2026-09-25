@@ -15,6 +15,11 @@ namespace Proxify.Client;
 /// Параметры туннеля (игровой сервер, флаги capture/aliases/tcp) приходят от
 /// сервера в кадре AuthAck. Сессионный ключ выводится из ECDH при рукопожатии
 /// и обновляется при повторной авторизации (если сервер долго не отвечает).
+///
+/// TCP и UDP разделены конфигом сервера: правило TCP (флаг tcp в AuthAck)
+/// обслуживает только TCP-проксирование через туннель; правило UDP — только
+/// UDP с подменой реального IP. Для TCP-правила UDP-компоненты (инжектор,
+/// loopback-алиасы, перехват ответов) не создаются.
 /// </summary>
 public sealed class ProxySession : IDisposable
 {
@@ -75,10 +80,18 @@ public sealed class ProxySession : IDisposable
         var config = Config;
         Console.WriteLine("=== Прокси-клиент (RealIP) ===");
         Console.WriteLine($"Прокси-сервер (машина A) : {ProxyServer}");
-        Console.WriteLine($"Игровой сервер (локально): {config!.GameIp}:{config.GamePort}");
-        Console.WriteLine($"Перехват ответов          : {(config.CaptureReplies ? "вкл" : "выкл")}");
-        Console.WriteLine($"Loopback-алиасы           : {(config.LoopbackAliases ? "вкл" : "выкл")}");
-        Console.WriteLine($"TCP-проксирование         : {(config.TcpEnabled ? "вкл" : "выкл")}");
+        if (config!.TcpEnabled)
+        {
+            Console.WriteLine($"TCP-проксирование         : вкл (игровой сервер {config.GameIp}:{config.GamePort})");
+            Console.WriteLine("Перехват ответов/UDP       : не используются (TCP-правило)");
+        }
+        else
+        {
+            Console.WriteLine($"Игровой сервер (локально): {config.GameIp}:{config.GamePort}");
+            Console.WriteLine($"Перехват ответов          : {(config.CaptureReplies ? "вкл" : "выкл")}");
+            Console.WriteLine($"Loopback-алиасы           : {(config.LoopbackAliases ? "вкл" : "выкл")}");
+            Console.WriteLine($"TCP-проксирование         : выкл (UDP-правило)");
+        }
         Console.WriteLine("Шифрование туннеля        : ECDSA P-256 + ECDH P-256 + AES-256-GCM (сессионный ключ)");
         Console.WriteLine($"Маскировка датаграмм      : {(_wire != null
             ? "внешний AEAD-слой от ключа клиента (на проводе только случайные байты)"
@@ -133,15 +146,21 @@ public sealed class ProxySession : IDisposable
         var config = Config!;
 
         // 2. Компоненты с известным конфигом (нужны адрес и порт игрового сервера).
-        var aliases = new LoopbackAliasManager(config.LoopbackAliases);
-        _aliases = aliases;
-        _injector = new RawInjector(config.GameIp, config.GamePort);
-        _tcpRelay = new TcpRelay(config.GameIp, config.GamePort, Tunnel, ProxyServer, () => Cipher, Stats, ServerTcp, _wire);
-
-        if (config.CaptureReplies)
+        // TCP-правило: только TCP-релей через туннель (UDP-компоненты не нужны).
+        // UDP-правило: инжектор с подменой IP, loopback-алиасы и перехват ответов.
+        if (config.TcpEnabled)
         {
-            _sniffer = new ReplySniffer(IPAddress.Loopback, config.GamePort, KnownClients, Tunnel, ProxyServer, () => Cipher, Stats, cts.Token, _wire);
-            tasks.Add(Task.Run(_sniffer.Run));
+            _tcpRelay = new TcpRelay(config.GameIp, config.GamePort, Tunnel, ProxyServer, () => Cipher, Stats, ServerTcp, _wire);
+        }
+        else
+        {
+            _aliases = new LoopbackAliasManager(config.LoopbackAliases);
+            _injector = new RawInjector(config.GameIp, config.GamePort);
+            if (config.CaptureReplies)
+            {
+                _sniffer = new ReplySniffer(IPAddress.Loopback, config.GamePort, KnownClients, Tunnel, ProxyServer, () => Cipher, Stats, cts.Token, _wire);
+                tasks.Add(Task.Run(_sniffer.Run));
+            }
         }
 
         using var statsTimer = new Timer(_ => Stats.Print("прокси-клиент"), null, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(1));
@@ -166,7 +185,7 @@ public sealed class ProxySession : IDisposable
             _sniffer?.Dispose();
             _injector?.Dispose();
             _tcpRelay?.Dispose();
-            aliases.Dispose();
+            _aliases?.Dispose();
             Console.WriteLine("Прокси-клиент остановлен.");
         }
     }

@@ -48,10 +48,11 @@ public sealed class ProxyServer : IDisposable
         foreach (var session in Sessions)
         {
             var client = session.Client;
+            var protocol = client.Config.TcpEnabled
+                ? $"TCP (порт {client.Config.Port} -> игра {client.Config.GameIp}:{client.Config.GamePort})"
+                : $"UDP (порт {client.Config.Port} -> игра {client.Config.GameIp}:{client.Config.GamePort})";
             Console.WriteLine($"  Клиент '{client.DisplayName}':");
-            Console.WriteLine($"    игроки (UDP) : {client.Config.Port}");
-            Console.WriteLine($"    игровой сервер: {client.Config.GameIp}:{client.Config.GamePort} (на машине B)");
-            Console.WriteLine($"    TCP-проксирование: {(client.Config.TcpEnabled ? $"вкл (порт {client.Config.TcpPort})" : "выкл")}");
+            Console.WriteLine($"    правило: {protocol}");
             Console.WriteLine($"    маскировка туннеля: {(client.Config.WireObfuscation ? "вкл" : "выкл")}");
             Console.WriteLine($"    публичный ключ: {DescribeKey(client.Config.PublicKeyPem)}");
             Console.WriteLine($"    статус        : {(client.Cipher == null ? "ждёт авторизации" : "сессия активна")}");
@@ -66,9 +67,10 @@ public sealed class ProxyServer : IDisposable
         var loops = new List<Task> { Task.Run(TunnelLoop) };
         foreach (var session in Sessions)
         {
-            loops.Add(Task.Run(session.PlayerLoopAsync));
-            if (session.Client.TcpListener != null)
+            if (session.Client.Config.TcpEnabled)
                 loops.Add(Task.Run(session.TcpLoopAsync));
+            else
+                loops.Add(Task.Run(session.PlayerLoopAsync));
         }
         await Task.WhenAll(loops);
     }

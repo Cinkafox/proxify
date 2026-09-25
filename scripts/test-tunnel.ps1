@@ -1,5 +1,8 @@
 param(
     [string]$Key = "",
+    # Закрытый ключ TCP-правила (отдельный клиент): если не задан, будет
+    # сгенерирована временная пара ключей.
+    [string]$TcpKey = "",
     [string]$Config = "",
     [int]$TunnelPort = 5600,
     [int]$Port = 27015,
@@ -322,6 +325,23 @@ function Build-TcpCloseFrame {
     return Build-ControlFrame -Type 7 -Body (Write-U32BE $ConnId) -Key $Key
 }
 
+function Read-YamlPorts {
+    # Достаёт публичные порты UDP- и TCP-правил из YAML-конфига.
+    param([string]$ConfigPath)
+    $udp = $null
+    $tcp = $null
+    foreach ($line in Get-Content -LiteralPath $ConfigPath) {
+        if ($line -notmatch '^\s*\d') { continue }
+        $keyPart = ($line -split ":")[0]
+        if ($keyPart -match '^(\d+)') {
+            $p = [int]$Matches[1]
+            if ($line -match 'tcp') { $tcp = $p }
+            elseif ($null -eq $udp) { $udp = $p }
+        }
+    }
+    return [pscustomobject]@{ Udp = $udp; Tcp = $tcp }
+}
+
 # --- Подготовка ---
 
 $root = Split-Path -Parent $PSScriptRoot
@@ -330,11 +350,18 @@ if (-not (Test-Path $serverDll)) {
     throw "Не найдена сборка: $serverDll. Сначала выполните: dotnet build Proxify.slnx -c Release"
 }
 
-# Загружаем закрытый ключ клиента и строим конфиг сервера (если не задан).
+# Закрытый ключ UDP-правила. TCP-правило — отдельная клиентская пара ключей.
 $keyPem = Get-Content -LiteralPath $Key -Raw
 $identity = [System.Security.Cryptography.ECDsa]::Create()
 $identity.ImportFromPem($keyPem)
-Initialize-WireKeys -IdentityKey $identity
+
+$tcpIdentity = [System.Security.Cryptography.ECDsa]::Create()
+if (-not [string]::IsNullOrEmpty($TcpKey)) {
+    $tcpIdentity.ImportFromPem((Get-Content -LiteralPath $TcpKey -Raw))
+} else {
+    $tcpIdentity.GenerateKey([System.Security.Cryptography.ECCurve+NamedCurves]::nistP256)
+}
+
 $script:useWire = $Obfuscation.IsPresent
 
 $workDir = Join-Path $env:TEMP "proxify-test-$(Get-Random)"
@@ -344,33 +371,45 @@ $tcpEnabled = -not $NoTcp
 $configPath = $Config
 if ([string]::IsNullOrEmpty($configPath)) {
     $publicPem = $identity.ExportSubjectPublicKeyInfoPem()
+    $tcpPublicPem = $tcpIdentity.ExportSubjectPublicKeyInfoPem()
     $publicKeyFile = Join-Path $workDir "client-public.pem"
+    $tcpPublicKeyFile = Join-Path $workDir "tcp-client-public.pem"
     Set-Content -LiteralPath $publicKeyFile -Value $publicPem -NoNewline
-    $configPath = Join-Path $workDir "server.json"
-    $cfgJson = @{
-        clients = @(
-            @{
-                name       = "test"
-                publicKey  = "client-public.pem"
-                port       = $Port
-                gameIp     = "127.0.0.1"
-                gamePort   = $GamePort
-                capture    = $true
-                aliases    = $false
-                tcp        = $tcpEnabled
-                tcpPort    = $TcpPort
-                obfuscation = ($script:useWire)
-            }
-        )
-    } | ConvertTo-Json -Depth 5
-    Set-Content -LiteralPath $configPath -Value $cfgJson
+    Set-Content -LiteralPath $tcpPublicKeyFile -Value $tcpPublicPem -NoNewline
+    $configPath = Join-Path $workDir "server.yml"
+    $obfValue = if ($script:useWire) { "true" } else { "false" }
+    $yaml = @"
+---
+# Автоконфиг теста: каждое правило = отдельный прокси-клиент со своим ключом.
+# UDP-правило: публичный порт $Port -> игровой $GamePort
+${Port}:$($GamePort):
+  name: udp-test
+  publicKey: client-public.pem
+  gameIp: 127.0.0.1
+  capture: true
+  aliases: false
+  obfuscation: $obfValue
+
+# TCP-правило: публичный порт $TcpPort -> игровой TCP-порт $GamePort
+$($TcpPort):$($GamePort) tcp:
+  name: tcp-test
+  publicKey: tcp-client-public.pem
+  gameIp: 127.0.0.1
+  obfuscation: $obfValue
+"@
+    Set-Content -LiteralPath $configPath -Value $yaml
 }
 
 Write-Host "=== Тест туннеля (ECDSA P-256 + ECDH P-256 + HKDF + AES-256-GCM) ==="
 Write-Host "Конфиг сервера : $configPath"
-Write-Host "Закрытый ключ  : $Key"
+Write-Host "Ключ UDP-правила: $Key"
+if (-not [string]::IsNullOrEmpty($TcpKey)) {
+    Write-Host "Ключ TCP-правила: $TcpKey"
+} else {
+    Write-Host "Ключ TCP-правила: (сгенерирована временная пара)"
+}
 Write-Host "Порт туннеля   : $TunnelPort"
-Write-Host "Порт игроков   : $(if ([string]::IsNullOrEmpty($Config)) { $Port } else { '(из конфига)' })"
+Write-Host "Порт игроков   : UDP=$Port TCP=$TcpPort (в авто-конфиге)"
 Write-Host "Маскировка     : $(if ($script:useWire) { 'вкл (внешний AEAD-слой, -Obfuscation)' } else { 'ВЫКЛЮЧЕНА (по умолчанию)' })"
 Write-Host ""
 
@@ -383,12 +422,81 @@ Start-Sleep -Milliseconds 1500
 $tunnel = $null
 $player = $null
 $tcpClient = $null
-$cfg = $null
+$udpSess = $null
+$tcpSess = $null
+
+function Open-Session {
+    param(
+        [System.Security.Cryptography.ECDsa]$IdentityKey,
+        [string]$Tag
+    )
+    $script:tunnel = New-TestUdp
+    Initialize-WireKeys -IdentityKey $IdentityKey
+
+    $nonce = New-Object byte[] 16
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $rng.GetBytes($nonce) } finally { $rng.Dispose() }
+    $ecdh = [System.Security.Cryptography.ECDiffieHellman]::Create([System.Security.Cryptography.ECCurve+NamedCurves]::nistP256)
+
+    $auth = Build-AuthFrame -Key $IdentityKey -Ecdh $ecdh -Nonce $nonce
+    Send-TunnelFrame -Inner $auth
+
+    $ack = Receive-TunnelFrame -Socket $script:tunnel -TimeoutMs 3000 -What "$Tag AuthAck"
+    if ($ack[2] -ne 0x09) { throw "Ожидался кадр AuthAck (0x09), получен 0x$('{0:X2}' -f $ack[2])" }
+    if ($ack.Length -lt 3 + 32 + 32 + 28) { throw "AuthAck слишком короткий" }
+    $sX = New-Object byte[] 32
+    $sY = New-Object byte[] 32
+    [Array]::Copy($ack, 3, $sX, 0, 32)
+    [Array]::Copy($ack, 35, $sY, 0, 32)
+    $wrappedProof = New-Object byte[] ($ack.Length - 67)
+    [Array]::Copy($ack, 67, $wrappedProof, 0, $wrappedProof.Length)
+
+    $sessionKey = Derive-SessionKey -Ecdh $ecdh -sX $sX -sY $sY
+
+    $proof = Unwrap-Data -Key $sessionKey -Blob $wrappedProof
+    if ($proof.Length -ne 23) { throw "Неверная длина proof: $($proof.Length)" }
+    for ($i = 0; $i -lt 16; $i++) {
+        if ($proof[$i] -ne $nonce[$i]) { throw "echo nonce не совпадает" }
+    }
+    $flags = $proof[16]
+    $gameIp = "$($proof[17]).$($proof[18]).$($proof[19]).$($proof[20])"
+    $gamePort = Read-U16BE -Bytes $proof -Offset 21
+    Write-Host "[$Tag 1] AuthAck: конфиг получен и расшифрован (игра $gameIp`:$gamePort, флаги 0x$('{0:X2}' -f $flags))"
+    if ($gamePort -ne $GamePort) { throw "Игровой порт из конфига не совпадает: $gamePort" }
+
+    # PING / PONG — маркер случайной длины, как в клиенте.
+    $tokenLen = 16 + (Get-Random -Minimum 0 -Maximum 49)
+    $pingToken = New-Object byte[] $tokenLen
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $rng.GetBytes($pingToken) } finally { $rng.Dispose() }
+    $ping = Build-ControlFrame -Type 3 -Body $pingToken -Key $sessionKey
+    Send-TunnelFrame -Inner $ping
+    $pong = Receive-TunnelFrame -Socket $script:tunnel -TimeoutMs 3000 -What "$Tag PONG"
+    $pongBody = Decode-EncryptedBody -Frame $pong -Key $sessionKey -ExpectedType 4
+    if ($pongBody.Length -ne ($tokenLen + 1)) { throw "Неверный формат PONG ($($pongBody.Length) байт)" }
+    for ($i = 0; $i -lt $tokenLen; $i++) {
+        if ($pongBody[$i] -ne $pingToken[$i]) { throw "Маркер PONG не совпадает с PING" }
+    }
+    $tcpFlag = $pongBody[$tokenLen] -eq 1
+    Write-Host "[$Tag 2] PONG OK (tcp-флаг: $tcpFlag)."
+
+    return , [pscustomobject]@{
+        Socket      = $script:tunnel
+        Ecdh        = $ecdh
+        SessionKey  = $sessionKey
+        GameIp      = $gameIp
+        GamePort    = $gamePort
+        TcpFlag     = $tcpFlag
+    }
+}
 
 try {
-    # Узнаём фактический порт игроков из конфига.
-    $rawCfg = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
-    $playerPort = [int]$rawCfg.clients[0].port
+    # Публичные порты UDP- и TCP-правил из YAML-конфига.
+    $ports = Read-YamlPorts -ConfigPath $configPath
+    $playerPort = $ports.Udp
+    $tcpPlayerPort = $ports.Tcp
+    $tcpEnabled = -not $NoTcp -and ($null -ne $tcpPlayerPort)
+    if ($null -eq $playerPort) { throw "Не найден порт UDP-правила в конфиге" }
 
     # --- 0. Отрицательный тест: чужой ключ должен быть отвергнут ---
     Write-Host "[0] Негативный тест: Auth чужим ключом должен быть отвергнут..."
@@ -447,88 +555,52 @@ try {
     }
     Write-Host "    OK: сервер отверг Auth чужого ключа."
 
-    # --- 1. Рукопожатие Auth / AuthAck ---
-    $tunnel = New-TestUdp
-    $nonce = New-Object byte[] 16
-    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
-    try { $rng.GetBytes($nonce) } finally { $rng.Dispose() }
-    $ecdh = [System.Security.Cryptography.ECDiffieHellman]::Create([System.Security.Cryptography.ECCurve+NamedCurves]::nistP256)
+    # --- 1. Сессия UDP-правила: Auth / AuthAck / PING-PONG ---
+    $udpSess = Open-Session -IdentityKey $identity -Tag "UDP"
+    if ($udpSess.TcpFlag) { throw "UDP-правило не должно иметь tcp-флаг" }
+    $script:tunnel = $udpSess.Socket
+    Write-Host "[UDP 0] Авторизация UDP-правила: локальный порт туннеля $($udpSess.Socket.Client.LocalEndPoint.Port)"
 
-    $auth = Build-AuthFrame -Key $identity -Ecdh $ecdh -Nonce $nonce
-    Send-TunnelFrame -Inner $auth
-    Write-Host "[1] Auth отправлен, локальный порт туннеля $($tunnel.Client.LocalEndPoint.Port)"
-
-    $ack = Receive-TunnelFrame -Socket $tunnel -TimeoutMs 3000 -What "AuthAck"
-    if ($ack[2] -ne 0x09) { throw "Ожидался кадр AuthAck (0x09), получен 0x$('{0:X2}' -f $ack[2])" }
-    if ($ack.Length -lt 3 + 32 + 32 + 28) { throw "AuthAck слишком короткий" }
-    $sX = New-Object byte[] 32
-    $sY = New-Object byte[] 32
-    [Array]::Copy($ack, 3, $sX, 0, 32)
-    [Array]::Copy($ack, 35, $sY, 0, 32)
-    $wrappedProof = New-Object byte[] ($ack.Length - 67)
-    [Array]::Copy($ack, 67, $wrappedProof, 0, $wrappedProof.Length)
-
-    $sessionKey = Derive-SessionKey -Ecdh $ecdh -sX $sX -sY $sY
-
-    $proof = Unwrap-Data -Key $sessionKey -Blob $wrappedProof
-    if ($proof.Length -ne 23) { throw "Неверная длина proof: $($proof.Length)" }
-    for ($i = 0; $i -lt 16; $i++) {
-        if ($proof[$i] -ne $nonce[$i]) { throw "echo nonce не совпадает" }
-    }
-    $flags = $proof[16]
-    $gameIp = "$($proof[17]).$($proof[18]).$($proof[19]).$($proof[20])"
-    $gamePort = Read-U16BE -Bytes $proof -Offset 21
-    Write-Host "[2] AuthAck получен: сессионный ключ + конфиг (игра $gameIp`:$gamePort, flags=0x$('{0:X2}' -f $flags))"
-    if ($gamePort -ne $GamePort) { throw "Игровой порт из конфига не совпадает" }
-    Write-Host "    OK: конфиг от сервера получен и расшифрован."
-
-    # --- 2. PING / PONG ---
-    # Маркер случайной длины (16..64 байта) — как в клиенте: размер и интервал
-    # служебных кадров не должны быть постоянными.
-    $tokenLen = 16 + (Get-Random -Minimum 0 -Maximum 49)
-    $pingToken = New-Object byte[] $tokenLen
-    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
-    try { $rng.GetBytes($pingToken) } finally { $rng.Dispose() }
-    $ping = Build-ControlFrame -Type 3 -Body $pingToken -Key $sessionKey
-    Send-TunnelFrame -Inner $ping
-    $pong = Receive-TunnelFrame -Socket $tunnel -TimeoutMs 3000 -What "PONG"
-    $pongBody = Decode-EncryptedBody -Frame $pong -Key $sessionKey -ExpectedType 4
-    if ($pongBody.Length -ne ($tokenLen + 1)) { throw "Неверный формат PONG ($($pongBody.Length) байт, ожидалось $($tokenLen + 1))" }
-    for ($i = 0; $i -lt $tokenLen; $i++) {
-        if ($pongBody[$i] -ne $pingToken[$i]) { throw "Маркер PONG не совпадает с PING" }
-    }
-    $tcpFlag = $pongBody[$tokenLen] -eq 1
-    Write-Host "[3] PONG OK (tcp-флаг из PONG: $tcpFlag)."
-
-    # --- 3. UDP: игрок -> сервер -> туннель -> игрок ---
+    # --- 2. UDP: игрок -> сервер -> туннель -> игрок ---
     $player = New-TestUdp
     $player.Connect("127.0.0.1", $playerPort)
     $hello = [Text.Encoding]::UTF8.GetBytes("HELLO")
     [void]$player.Send($hello, $hello.Length)
-    Write-Host "[4] Игрок отправил 'HELLO' на 127.0.0.1:$playerPort"
+    Write-Host "[UDP 3] Игрок отправил 'HELLO' на 127.0.0.1:$playerPort"
 
-    $frame = Receive-TunnelFrame -Socket $tunnel -TimeoutMs 3000 -What "кадр данных"
-    $decoded = Decode-DataFrame -Frame $frame -Key $sessionKey
-    Write-Host "[5] Кадр от сервера: клиент=$($decoded.ClientIp):$($decoded.ClientPort) payload='$($decoded.PayloadText)'"
+    $frame = Receive-TunnelFrame -Socket $udpSess.Socket -TimeoutMs 3000 -What "кадр данных"
+    $decoded = Decode-DataFrame -Frame $frame -Key $udpSess.SessionKey
+    Write-Host "[UDP 4] Кадр от сервера: клиент=$($decoded.ClientIp):$($decoded.ClientPort) payload='$($decoded.PayloadText)'"
     if ($decoded.PayloadText -ne "HELLO") { throw "Кадр не соответствует ожидаемому формату" }
 
     $reply = [Text.Encoding]::UTF8.GetBytes("REPLY")
-    $rf = Build-EncryptedDataFrame -ClientIp $decoded.ClientIp -ClientPort $decoded.ClientPort -Payload $reply -Key $sessionKey
+    $rf = Build-EncryptedDataFrame -ClientIp $decoded.ClientIp -ClientPort $decoded.ClientPort -Payload $reply -Key $udpSess.SessionKey
     Send-TunnelFrame -Inner $rf
-    Write-Host "[6] Эмуляция прокси-клиента отправила кадр-ответ."
+    Write-Host "[UDP 5] Эмуляция прокси-клиента отправила кадр-ответ."
 
     $player.Client.ReceiveTimeout = 3000
     $playerEp = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
     $got = $player.Receive([ref]$playerEp)
     $gotText = [Text.Encoding]::UTF8.GetString($got)
-    Write-Host "[7] Игрок получил: '$gotText' от $($playerEp.Address):$($playerEp.Port)"
+    Write-Host "[UDP 6] Игрок получил: '$gotText' от $($playerEp.Address):$($playerEp.Port)"
     if ($gotText -ne "REPLY") { throw "Игрок получил неверный ответ" }
     Write-Host "    OK: UDP-путь через туннель работает."
 
-    # --- 4. TCP (если включено в конфиге) ---
+    # Сессия UDP больше не нужна — закрываем её сокет.
+    $udpSess.Socket.Close()
+    $udpSess.Ecdh.Dispose()
+    $udpSess.Socket = $null
+
+    # --- 4. TCP-правило (отдельный клиент, отдельная сессия) ---
     if ($tcpEnabled) {
-        Write-Host "[TCP 1] Игрок подключается по TCP к 127.0.0.1:$TcpPort"
-        $tcpClient = New-Object System.Net.Sockets.TcpClient("127.0.0.1", $TcpPort)
+        Write-Host "[TCP 0] Открываем сессию TCP-правила (свой ключ)..."
+        $tcpSess = Open-Session -IdentityKey $tcpIdentity -Tag "TCP"
+        if (-not $tcpSess.TcpFlag) { throw "TCP-правило должно иметь tcp-флаг" }
+        $script:tunnel = $tcpSess.Socket
+        $sessionKey = $tcpSess.SessionKey
+
+        Write-Host "[TCP 1] Игрок подключается по TCP к 127.0.0.1:$tcpPlayerPort"
+        $tcpClient = New-Object System.Net.Sockets.TcpClient("127.0.0.1", $tcpPlayerPort)
         $tcpStream = $tcpClient.GetStream()
         $tcpStream.ReadTimeout = 3000
 
@@ -619,7 +691,7 @@ try {
     }
 
     Write-Host ""
-    Write-Host "ИТОГ: туннель работает (Auth, PING/PONG, UDP и TCP)."
+    Write-Host "ИТОГ: туннель работает (Auth, PING/PONG, UDP и TCP как отдельные правила с отдельными клиентами)."
 }
 catch {
     Write-Host ""
@@ -630,8 +702,12 @@ catch {
     }
 }
 finally {
-    $ecdh.Dispose()
     $identity.Dispose()
+    if ($tcpIdentity) { $tcpIdentity.Dispose() }
+    if ($udpSess -and $udpSess.Socket) { $udpSess.Socket.Close() }
+    if ($udpSess) { $udpSess.Ecdh.Dispose() }
+    if ($tcpSess -and $tcpSess.Socket) { $tcpSess.Socket.Close() }
+    if ($tcpSess) { $tcpSess.Ecdh.Dispose() }
     if ($tcpClient) { $tcpClient.Close() }
     if ($tunnel) { $tunnel.Close() }
     if ($player) { $player.Close() }
