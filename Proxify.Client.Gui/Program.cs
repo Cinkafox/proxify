@@ -1,31 +1,61 @@
 using System.Diagnostics;
+using Avalonia;
 using Proxify.Client.Gui;
 using Proxify.Client.Gui.Support;
 
-ApplicationConfiguration.Initialize();
-
-// RawSocket-инжекция пакетов требует прав администратора: без них клиент не запускается.
-if (!AdminRights.IsGranted())
+internal static class Program
 {
-    var exePath = Environment.ProcessPath;
-    if (string.IsNullOrEmpty(exePath))
-        return;
-
-    try
+    // Initialization code. Don't use any Avalonia, third-party APIs or any
+    // SynchronizationContext-reliant code before AppMain is called.
+    [STAThread]
+    public static void Main(string[] args)
     {
-        Process.Start(new ProcessStartInfo
+        // RawSocket-инжекция пакетов требует повышенных прав: на Windows — UAC,
+        // на Linux — перезапуск через pkexec. Если элевация недоступна (например,
+        // на машине нет pkexec, или пользователь отменил запрос), GUI всё равно
+        // запускается: сессия сообщит об отсутствии прав в журнале.
+        // Переменная окружения PROXIFY_NO_ELEVATE=1 отключает перезапуск (для
+        // автоматизации/CI или запуска в обычной сессии).
+        if (!AdminRights.IsGranted() && Environment.GetEnvironmentVariable("PROXIFY_NO_ELEVATE") != "1")
         {
-            FileName = exePath,
-            UseShellExecute = true,
-            Verb = "runas",
-        });
+            var exePath = Environment.ProcessPath;
+            if (!string.IsNullOrEmpty(exePath) && TryElevate(exePath))
+                return;
+        }
+
+        BuildAvaloniaApp().StartWithClassicDesktopLifetime(args);
     }
-    catch
+
+    private static bool TryElevate(string exePath)
     {
-        // ignored
+        try
+        {
+            if (OperatingSystem.IsWindows())
+            {
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = exePath,
+                    UseShellExecute = true,
+                    Verb = "runas",
+                });
+                return true;
+            }
+
+            // Linux/macOS: polkit-аутентификация через pkexec.
+            var psi = new ProcessStartInfo("pkexec", $"\"{exePath}\"") { UseShellExecute = false };
+            Process.Start(psi);
+            return true;
+        }
+        catch
+        {
+            // элевация не удалась — продолжаем без неё
+            return false;
+        }
     }
 
-    return;
+    // Avalonia configuration, don't remove; also used by visual designer.
+    public static AppBuilder BuildAvaloniaApp()
+        => AppBuilder.Configure<App>()
+            .UsePlatformDetect()
+            .LogToTrace();
 }
-
-Application.Run(new MainForm());

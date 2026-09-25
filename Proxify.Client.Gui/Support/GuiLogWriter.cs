@@ -1,3 +1,5 @@
+using System.Text;
+
 namespace Proxify.Client.Gui.Support;
 
 /// <summary>
