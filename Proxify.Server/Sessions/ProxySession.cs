@@ -3,6 +3,7 @@ using System.Net.Sockets;
 using System.Security.Cryptography;
 using Proxify.Common.Config;
 using Proxify.Common.Crypto;
+using Proxify.Common.Metrics;
 using Proxify.Common.Protocol;
 using Proxify.Common.Sessions;
 
@@ -21,13 +22,19 @@ public abstract class ProxySession : SharedProxySession
 {
     private readonly ClientSession _client;
 
-    protected ProxySession(ClientSession client, UdpClient tunnel, AsyncWorkQueue tunnelWork, TunnelStats stats)
-        : base(tunnel, stats, tunnelWork, client.Wire)
+    protected ProxySession(ClientSession client, UdpClient tunnel, AsyncWorkQueue tunnelWork, TunnelMetricsHandle metrics)
+        : base(tunnel, metrics, tunnelWork, client.Wire)
     {
         _client = client;
     }
 
     public ClientSession Client => _client;
+
+    /// <summary>
+    /// Число игроков (UDP-правило) или активных TCP-соединений — источник гаужа
+    /// <c>proxify_tunnel_players</c>.
+    /// </summary>
+    public abstract int PlayersCount { get; }
 
     public override TunnelCipher? Cipher => _client.Cipher;
     public override ClientConfig? Config => _client.Config;
@@ -76,6 +83,7 @@ public abstract class ProxySession : SharedProxySession
 
         _client.SetSession(from, cipher);
         Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [auth] Клиент '{_client.DisplayName}' авторизован: {from}.");
+        Metrics.SetAuthorized(true);
 
         var proof = _client.Config.EncodeProof(nonce, cipher);
         var ack = Frame.EncodeAuthAck(sX, sY, proof);
@@ -109,7 +117,7 @@ public abstract class ProxySession : SharedProxySession
             }
             else
             {
-                Interlocked.Increment(ref Stats.BadFrames);
+                Metrics.CountBadFrame();
                 Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] PING от {from} не разобран (возможно, сессия устарела).");
             }
             return;

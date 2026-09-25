@@ -3,6 +3,7 @@ using System.Net.Sockets;
 using System.Threading.Channels;
 using Proxify.Common.Config;
 using Proxify.Common.Crypto;
+using Proxify.Common.Metrics;
 using Proxify.Common.Protocol;
 using Proxify.Common.Sessions;
 using Proxify.Server.Sessions;
@@ -33,21 +34,46 @@ public sealed class ProxyServer : IDisposable
     public int TunnelPort { get; }
     public List<ProxySession> Sessions { get; } = new();
     public UdpClient Tunnel { get; }
-    public TunnelStats Stats { get; } = new();
+    public TunnelMetrics Metrics { get; }
     public AsyncWorkQueue TunnelWork { get; }
 
-    public ProxyServer(List<ClientConfig> configs, int tunnelPort)
+    public ProxyServer(List<ClientConfig> configs, int tunnelPort, TunnelMetrics metrics)
     {
         TunnelPort = tunnelPort;
+        Metrics = metrics;
+        metrics.TunnelPort.Set(tunnelPort);
         Tunnel = new UdpClient(new IPEndPoint(IPAddress.Any, tunnelPort));
         TunnelWork = new AsyncWorkQueue(Math.Clamp(Environment.ProcessorCount, 2, 8));
 
         foreach (var config in configs)
         {
+            var session = new ClientSession(config);
             if (config.Protocol == TunnelProtocol.Tcp)
-                Sessions.Add(new TcpProxySession(new ClientSession(config), Tunnel, TunnelWork, Stats));
+                Sessions.Add(new TcpProxySession(session, Tunnel, TunnelWork, metrics.ForClient(session.DisplayName)));
             else
-                Sessions.Add(new UdpProxySession(new ClientSession(config), Tunnel, TunnelWork, Stats));
+                Sessions.Add(new UdpProxySession(session, Tunnel, TunnelWork, metrics.ForClient(session.DisplayName)));
+        }
+
+        metrics.AddRefreshCallback(RefreshMetrics);
+    }
+
+    /// <summary>
+    /// Обновляет «живые» гаужи метрик: число игроков/соединений и глубину очереди
+    /// обработки. Вызывается по таймеру, только если метрики включены
+    /// (<c>--metrics-port</c>), иначе значения остаются нулевыми.
+    /// </summary>
+    private void RefreshMetrics()
+    {
+        Metrics.TunnelPort.Set(TunnelPort);
+
+        // Очередь обработки на сервере одна на всех клиентов, поэтому глубина
+        // отдаётся как метрика процесса, а не каждого правила.
+        Metrics.Process.SetQueueDepth(TunnelWork.PendingCount);
+
+        foreach (var session in Sessions)
+        {
+            session.Metrics.SetPlayers(session.PlayersCount);
+            session.Metrics.SetAuthorized(session.Client.Cipher != null);
         }
     }
 
@@ -55,6 +81,7 @@ public sealed class ProxyServer : IDisposable
     {
         Console.WriteLine("=== Прокси-сервер (RealIP) ===");
         Console.WriteLine($"Порт туннеля                : {TunnelPort}");
+        Console.WriteLine($"Метрики Prometheus          : {(Metrics.Enabled ? $"вкл — {Metrics.ExpositionUrl}" : "выкл (задайте --metrics-port, чтобы включить)")}");
         foreach (var session in Sessions)
         {
             var client = session.Client;
@@ -150,7 +177,7 @@ var protocol = client.Config.Protocol == TunnelProtocol.Tcp
                     return;
             }
 
-            Interlocked.Increment(ref Stats.BadFrames);
+            Metrics.UnauthorizedFrames.Inc();
             LogUnknownFrame(from);
         }
         catch (Exception ex)
@@ -170,14 +197,14 @@ var protocol = client.Config.Protocol == TunnelProtocol.Tcp
     {
         if (!Frame.TryDecodeAuth(inner, inner.Length, out var version, out var ephX, out var ephY, out var nonce, out var signature))
         {
-            Interlocked.Increment(ref Stats.BadFrames);
+            candidate.Metrics.CountBadFrame();
             Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Не удалось разобрать кадр Auth от {from}.");
             return false;
         }
 
         if (version != TunnelKeys.AuthVersion)
         {
-            Interlocked.Increment(ref Stats.BadFrames);
+            candidate.Metrics.CountBadFrame();
             Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Auth от {from} с неизвестной версией {version}.");
             return false;
         }
@@ -185,7 +212,7 @@ var protocol = client.Config.Protocol == TunnelProtocol.Tcp
         var payload = TunnelKeys.BuildAuthPayload(ephX, ephY, nonce);
         if (!candidate.TryAuthenticate(from, payload, signature, ephX, ephY, nonce))
         {
-            Interlocked.Increment(ref Stats.BadFrames);
+            candidate.Metrics.CountBadFrame();
             Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Auth от {from}: подпись не соответствует зарегистрированному ключу клиента '{candidate.Client.DisplayName}'.");
             return false;
         }

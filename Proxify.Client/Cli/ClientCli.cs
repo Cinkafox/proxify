@@ -7,8 +7,9 @@ namespace Proxify.Client.Cli;
 
 /// <summary>
 /// Помощник командной строки прокси-клиента: разбор аргументов (--server,
-/// --tunnel-port, --local-port, --key, --keygen, --wire-obfuscation), загрузка
-/// ключа и генерация пары ключей. Программа (Program.cs) остаётся тонкой.
+/// --tunnel-port, --local-port, --key, --keygen, --wire-obfuscation,
+/// --metrics-port), загрузка ключа и генерация пары ключей. Программа (Program.cs)
+/// остаётся тонкой.
 /// </summary>
 public static class ClientCli
 {
@@ -18,11 +19,12 @@ public static class ClientCli
         .Add("local-port", "Локальный UDP-порт туннеля клиента. Если не задан, ОС выберет свободный (port 0). Полезно для файрволов.", shortName: 'l')
         .Add("key", "Путь к закрытому ключу клиента (PEM, PKCS#8). Создаётся командой --keygen", shortName: 'k')
         .Add("keygen", "Сгенерировать пару ключей в указанном каталоге (client-private.pem, client-public.pem) и выйти", shortName: 'g')
-        .Add("wire-obfuscation", "Внешняя маскировка туннеля: on или off (по умолчанию). Должна совпадать с настройкой 'obfuscation' в конфиге сервера", defaultValue: "off");
+        .Add("wire-obfuscation", "Внешняя маскировка туннеля: on или off (по умолчанию). Должна совпадать с настройкой 'obfuscation' в конфиге сервера", defaultValue: "off")
+        .Add("metrics-port", "TCP-порт для метрик Prometheus (GET /metrics). Без этой опции метрики выключены", shortName: 'm');
 
     /// <summary>
     /// Разбирает аргументы и валидирует их: адрес и порт сервера, локальный порт,
-    /// флаг маскировки и закрытый ключ.
+    /// флаг маскировки, порт метрик и закрытый ключ.
     /// </summary>
     public static ClientOptions Parse(string[] args)
     {
@@ -65,6 +67,19 @@ public static class ClientCli
         if (!TryParseWireObfuscation(cli.Get("wire-obfuscation"), out var wireObfuscation, out var wireError))
             return new ClientOptions { Error = wireError };
 
+        // Метрики необязательны: без опции экспорт не запускается вовсе.
+        int? metricsPort = null;
+        var metricsPortText = cli.Get("metrics-port");
+        if (!string.IsNullOrWhiteSpace(metricsPortText))
+        {
+            if (!NetUtils.TryParsePort(metricsPortText, out var parsedMetricsPort))
+                return new ClientOptions { ShowUsage = true, Error = $"'--metrics-port {metricsPortText}' не является допустимым (ожидается число от 1 до 65535)." };
+            metricsPort = parsedMetricsPort;
+        }
+
+        if (metricsPort == localPort)
+            return new ClientOptions { ShowUsage = true, Error = $"'--metrics-port {metricsPort}' совпадает с '--local-port' — конфликт." };
+
         var keyPath = cli.Get("key");
         if (string.IsNullOrWhiteSpace(keyPath) || !File.Exists(keyPath))
             return new ClientOptions { ShowUsage = true, Error = $"Закрытый ключ не найден: '{keyPath}'. Создайте его командой --keygen." };
@@ -79,6 +94,7 @@ public static class ClientCli
             IdentityKey = identityKey,
             LocalPort = localPort,
             WireObfuscation = wireObfuscation,
+            MetricsPort = metricsPort,
         };
     }
 

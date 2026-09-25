@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using Proxify.Common.Crypto;
+using Proxify.Common.Metrics;
 using Proxify.Common.Networking;
 using Proxify.Common.Protocol;
 using Proxify.Common.Sessions;
@@ -29,7 +30,7 @@ public sealed class ReplySniffer : IDisposable
     private readonly IPEndPoint _proxyServer;
     private readonly Func<TunnelCipher?> _cipherGetter;
     private readonly WireObfuscator? _wire;
-    private readonly TunnelStats _stats;
+    private readonly TunnelMetricsHandle _metrics;
     private readonly CancellationToken _cancellationToken;
     private readonly byte[] _buffer = new byte[65535];
 
@@ -40,7 +41,7 @@ public sealed class ReplySniffer : IDisposable
         UdpClient tunnel,
         IPEndPoint proxyServer,
         Func<TunnelCipher?> cipherGetter,
-        TunnelStats stats,
+        TunnelMetricsHandle metrics,
         CancellationToken cancellationToken,
         WireObfuscator? wire)
     {
@@ -49,7 +50,7 @@ public sealed class ReplySniffer : IDisposable
         _tunnel = tunnel;
         _proxyServer = proxyServer;
         _cipherGetter = cipherGetter;
-        _stats = stats;
+        _metrics = metrics;
         _cancellationToken = cancellationToken;
         _wire = wire;
 
@@ -96,7 +97,7 @@ public sealed class ReplySniffer : IDisposable
             if (!_knownClients.ContainsKey(client))
                 continue;
 
-            Interlocked.Increment(ref _stats.RepliesCaptured);
+            _metrics.CountRepliesCaptured();
             var cipher = _cipherGetter();
             if (cipher == null)
                 continue;
@@ -104,8 +105,9 @@ public sealed class ReplySniffer : IDisposable
 
             try
             {
-                _tunnel.Send(_wire?.Wrap(frame) ?? frame, _proxyServer);
-                Interlocked.Increment(ref _stats.PacketsOut);
+                var sealedFrame = _wire?.Wrap(frame) ?? frame;
+                _tunnel.Send(sealedFrame, _proxyServer);
+                _metrics.CountPacketsOut(sealedFrame.Length);
             }
             catch (SocketException ex)
             {

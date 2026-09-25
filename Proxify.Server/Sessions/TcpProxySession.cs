@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Sockets;
 using Proxify.Common.Crypto;
+using Proxify.Common.Metrics;
 using Proxify.Common.Protocol;
 using Proxify.Common.Sessions;
 using Proxify.Common.Tcp;
@@ -17,10 +18,13 @@ public sealed class TcpProxySession : ProxySession
 {
     private long _nextTcpConnId;
 
-    public TcpProxySession(ClientSession client, UdpClient tunnel, AsyncWorkQueue tunnelWork, TunnelStats stats)
-        : base(client, tunnel, tunnelWork, stats)
+    public TcpProxySession(ClientSession client, UdpClient tunnel, AsyncWorkQueue tunnelWork, TunnelMetricsHandle metrics)
+        : base(client, tunnel, tunnelWork, metrics)
     {
     }
+
+    /// <summary>Активные TCP-соединения игроков, ожидающие закрытия или данных.</summary>
+    public override int PlayersCount => Client.TcpClients.Count;
 
     /// <summary>
     /// Цикл приёма TCP-подключений игроков (только для TCP-правил конфига).
@@ -97,13 +101,13 @@ public sealed class TcpProxySession : ProxySession
                     }
                     else
                     {
-                        Interlocked.Increment(ref Stats.BadFrames);
+                        Metrics.CountBadFrame();
                         Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] TcpData для неизвестного connId {connId}.");
                     }
                 }
                 else
                 {
-                    Interlocked.Increment(ref Stats.BadFrames);
+                    Metrics.CountBadFrame();
                     Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Не удалось разобрать TcpData от {from}.");
                 }
                 break;
@@ -118,13 +122,13 @@ public sealed class TcpProxySession : ProxySession
                     }
                     else
                     {
-                        Interlocked.Increment(ref Stats.BadFrames);
+                        Metrics.CountBadFrame();
                         Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] TcpAck для неизвестного connId {ackConnId}.");
                     }
                 }
                 else
                 {
-                    Interlocked.Increment(ref Stats.BadFrames);
+                    Metrics.CountBadFrame();
                     Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Не удалось разобрать TcpAck от {from}.");
                 }
                 break;
@@ -138,7 +142,7 @@ public sealed class TcpProxySession : ProxySession
                 }
                 else
                 {
-                    Interlocked.Increment(ref Stats.BadFrames);
+                    Metrics.CountBadFrame();
                     Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Не удалось разобрать TcpClose от {from}.");
                 }
                 break;
@@ -149,7 +153,7 @@ public sealed class TcpProxySession : ProxySession
                 break;
 
             default:
-                Interlocked.Increment(ref Stats.BadFrames);
+                Metrics.CountBadFrame();
                 Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Получен посторонний кадр от {from} (кадр данных вне TCP-правила).");
                 break;
         }
@@ -265,8 +269,9 @@ public sealed class TcpProxySession : ProxySession
         if (proxy == null || cipher == null)
             return;
 
-        Interlocked.Increment(ref Stats.PacketsOut);
-        Tunnel.Send(SealFrame(Frame.EncodeTcpData(connId, seq, payload, cipher)), proxy);
+        var sealedFrame = SealFrame(Frame.EncodeTcpData(connId, seq, payload, cipher));
+        Metrics.CountPacketsOut(sealedFrame.Length);
+        Tunnel.Send(sealedFrame, proxy);
     }
 
     /// <summary>
@@ -294,6 +299,6 @@ public sealed class TcpProxySession : ProxySession
         }
 
         tcpClient.GetStream().Write(payload, 0, payload.Length);
-        Interlocked.Increment(ref Stats.RepliesRelayed);
+        Metrics.CountRepliesRelayed();
     }
 }

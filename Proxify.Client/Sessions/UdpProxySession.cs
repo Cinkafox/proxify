@@ -6,6 +6,7 @@ using System.Threading.Channels;
 using Proxify.Client.Injection;
 using Proxify.Common.Config;
 using Proxify.Common.Crypto;
+using Proxify.Common.Metrics;
 using Proxify.Common.Networking;
 using Proxify.Common.Protocol;
 using Proxify.Common.Sessions;
@@ -37,13 +38,17 @@ public sealed class UdpProxySession : ProxySession
         ECDsa identityKey,
         UdpClient tunnel,
         WireObfuscator? wire,
-        TunnelStats stats,
+        TunnelMetricsHandle metrics,
         AsyncWorkQueue work,
         TunnelCipher cipher,
-        ClientConfig config)
-        : base(proxyServer, identityKey, tunnel, wire, stats, work, cipher, config)
+        ClientConfig config,
+        TunnelMetrics processMetrics)
+        : base(proxyServer, identityKey, tunnel, wire, metrics, work, cipher, config, processMetrics)
     {
     }
+
+    /// <summary>Игроки, чьи пакеты уже переданы игровому серверу.</summary>
+    public override int PlayersCount => KnownClients.Count;
 
     protected override void PrintProtocolBanner(ClientConfig config)
     {
@@ -61,7 +66,7 @@ public sealed class UdpProxySession : ProxySession
 
         if (config.CaptureReplies)
         {
-            _sniffer = new ReplySniffer(IPAddress.Loopback, config.GamePort, KnownClients, Tunnel, ProxyServer, () => Cipher, Stats, ct, Wire);
+            _sniffer = new ReplySniffer(IPAddress.Loopback, config.GamePort, KnownClients, Tunnel, ProxyServer, () => Cipher, Metrics, ct, Wire);
             _snifferTask = Task.Run(_sniffer.Run);
         }
     }
@@ -79,13 +84,13 @@ public sealed class UdpProxySession : ProxySession
         if (frameType == Frame.TypeData)
         {
             Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Получен незашифрованный кадр, но шифрование включено. Проверьте конфиг у прокси-сервера.");
-            Interlocked.Increment(ref Stats.BadFrames);
+            Metrics.CountBadFrame();
             return;
         }
 
         if (frameType != Frame.TypeDataEncrypted)
         {
-            Interlocked.Increment(ref Stats.BadFrames);
+            Metrics.CountBadFrame();
             Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Получен посторонний кадр у UDP-правила (TCP-кадр?).");
             return;
         }
@@ -96,12 +101,12 @@ public sealed class UdpProxySession : ProxySession
 
         if (!Frame.TryDecodeData(data, length, cipher, out var clientIp, out var clientPort, out var payload))
         {
-            Interlocked.Increment(ref Stats.BadFrames);
+            Metrics.CountBadFrame();
             Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Не удалось разобрать кадр ({length} байт).");
             return;
         }
 
-        Interlocked.Increment(ref Stats.PacketsIn);
+        Metrics.CountPacketsIn(payload.Length);
 
         var injector = _injector;
         if (injector == null)
@@ -118,7 +123,7 @@ public sealed class UdpProxySession : ProxySession
                 ActiveIps[clientIp] = DateTime.UtcNow;
 
                 injector.Inject(clientIp, clientPort, payload);
-                Interlocked.Increment(ref Stats.Injected);
+                Metrics.CountInjected();
                 return Task.CompletedTask;
             });
         }

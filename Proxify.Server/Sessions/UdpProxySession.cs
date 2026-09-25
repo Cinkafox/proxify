@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Sockets;
 using System.Threading.Channels;
+using Proxify.Common.Metrics;
 using Proxify.Common.Protocol;
 using Proxify.Common.Sessions;
 
@@ -14,10 +15,13 @@ namespace Proxify.Server.Sessions;
 /// </summary>
 public sealed class UdpProxySession : ProxySession
 {
-    public UdpProxySession(ClientSession client, UdpClient tunnel, AsyncWorkQueue tunnelWork, TunnelStats stats)
-        : base(client, tunnel, tunnelWork, stats)
+    public UdpProxySession(ClientSession client, UdpClient tunnel, AsyncWorkQueue tunnelWork, TunnelMetricsHandle metrics)
+        : base(client, tunnel, tunnelWork, metrics)
     {
     }
+
+    /// <summary>Игроки, уже приславшие пакеты этому правилу.</summary>
+    public override int PlayersCount => Client.SeenClients.Count;
 
     /// <summary>
     /// Цикл приёма пакетов игроков (UDP-порт игроков этого клиента).
@@ -73,10 +77,11 @@ public sealed class UdpProxySession : ProxySession
             if (Client.SeenClients.TryAdd(from, 0))
                 Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [диагностика] Клиент '{Client.DisplayName}': новый игрок подключился: {from}.");
 
-            Interlocked.Increment(ref Stats.PacketsIn);
-            Interlocked.Increment(ref Stats.PacketsOut);
+            Metrics.CountPacketsIn(data.Length);
             var frame = Frame.EncodeData(from.Address, (ushort)from.Port, data, cipher);
-            await Tunnel.SendAsync(SealFrame(frame), proxyEndpoint);
+            var sealedFrame = SealFrame(frame);
+            Metrics.CountPacketsOut(sealedFrame.Length);
+            await Tunnel.SendAsync(sealedFrame, proxyEndpoint);
         }
         catch (Exception ex)
         {
@@ -93,7 +98,7 @@ public sealed class UdpProxySession : ProxySession
             if (frameType == Frame.TypeData)
             {
                 Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Получен незашифрованный кадр, но сервер работает только с шифрованием. Проверьте конфиг у прокси-клиента.");
-                Interlocked.Increment(ref Stats.BadFrames);
+                Metrics.CountBadFrame();
                 return;
             }
 
@@ -101,19 +106,19 @@ public sealed class UdpProxySession : ProxySession
             {
                 Client.TouchActivity();
                 var target = new IPEndPoint(clientIp, clientPort);
-                Interlocked.Increment(ref Stats.PacketsIn);
-                Interlocked.Increment(ref Stats.RepliesRelayed);
+                Metrics.CountPacketsIn(payload.Length);
+                Metrics.CountRepliesRelayed();
                 await Client.Udp!.SendAsync(payload, target);
             }
             else
             {
-                Interlocked.Increment(ref Stats.BadFrames);
+                Metrics.CountBadFrame();
                 Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Не удалось разобрать кадр от {from}.");
             }
             return;
         }
 
-        Interlocked.Increment(ref Stats.BadFrames);
+        Metrics.CountBadFrame();
         Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Получен посторонний кадр от {from} (TCP-кадр в UDP-правило?).");
     }
 }

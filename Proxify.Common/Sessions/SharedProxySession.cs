@@ -1,6 +1,7 @@
 using System.Net.Sockets;
 using Proxify.Common.Config;
 using Proxify.Common.Crypto;
+using Proxify.Common.Metrics;
 
 namespace Proxify.Common.Sessions;
 
@@ -8,21 +9,21 @@ namespace Proxify.Common.Sessions;
 /// Общие поля и методы прокси-сессий обеих машин: прокси-сервера (машина A)
 /// и прокси-клиента (машина B).
 ///
-/// Обе стороны туннеля держат общий UDP-сокет туннеля, статистику, очередь
-/// фоновой обработки кадров и внешний слой маскировки датаграмм
+/// Обе стороны туннеля держат общий UDP-сокет туннеля, ручки метрик Prometheus,
+/// очередь фоновой обработки кадров и внешний слой маскировки датаграмм
 /// (WireObfuscator). Сессионный ключ шифрования и конфиг правила доступны
 /// только после рукопожатия — наследники выставляют их абстрактными свойствами.
 ///
 /// Конкретный протокол (эмуляция UDP с подменой исходного IP или TCP-релей)
 /// живёт в наследниках: на сервере — Udp/TcpProxySession, на клиенте — тоже
-/// парные классы. Шифрование, heartbeat и статистика — общие.
+/// парные классы. Шифрование и сердцебиение — общие.
 /// </summary>
 public abstract class SharedProxySession : IDisposable
 {
-    protected SharedProxySession(UdpClient tunnel, TunnelStats stats, AsyncWorkQueue work, WireObfuscator? wire)
+    protected SharedProxySession(UdpClient tunnel, TunnelMetricsHandle metrics, AsyncWorkQueue work, WireObfuscator? wire)
     {
         Tunnel = tunnel;
-        Stats = stats;
+        Metrics = metrics;
         Work = work;
         Wire = wire;
     }
@@ -30,8 +31,8 @@ public abstract class SharedProxySession : IDisposable
     /// <summary>UDP-сокет туннеля (на сервере — общий для всех клиентов).</summary>
     protected UdpClient Tunnel { get; }
 
-    /// <summary>Счётчики трафика туннеля.</summary>
-    public TunnelStats Stats { get; }
+    /// <summary>Ручка метрик туннеля этой сессии (Prometheus).</summary>
+    public TunnelMetricsHandle Metrics { get; }
 
     /// <summary>Очередь фоновой обработки пакетов/кадров (сериализует работу по сокету).</summary>
     protected AsyncWorkQueue Work { get; }

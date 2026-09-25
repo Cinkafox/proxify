@@ -312,6 +312,11 @@ Proxify.Server.exe --config C:\proxify\config\server.yml --tunnel-port 5600
 UDP-порт туннеля — на него прокси-клиенты шлют кадры; не должен совпадать
 с портами игроков из конфига).
 
+Опционально `--metrics-port <порт>` (`-m`) поднимает HTTP-экспорт метрик
+Prometheus на этом порту; без опции метрики не отдаются. Порт не должен
+совпадать с портом туннеля и с публичными портами правил — иначе запуск
+завершается ошибкой.
+
 Вспомогательный режим: `Proxify.Server --configgen <каталог>` генерирует
 шаблон `server.yml` из `client-public.pem` в этом каталоге.
 
@@ -335,6 +340,11 @@ Proxify.Client.exe --server 1.2.3.4:5600 --key C:\keys\client1\client-private.pe
 на машине B обслуживаются отдельными процессами клиента (своя пара ключей,
 `--key` указывает на её закрытый ключ); для UDP-правила с `capture=true` нужны
 права администратора.
+
+Опционально `--metrics-port <порт>` (`-m`) поднимает HTTP-экспорт метрик
+Prometheus на этом порту; без опции метрики не отдаются. Порт не должен совпадать
+с `--local-port`. Если порт занят, клиент выводит предупреждение и продолжает
+работу без метрик.
 
 Вспомогательный режим: `Proxify.Client --keygen <каталог>` генерирует пару ключей.
 
@@ -360,10 +370,9 @@ Proxify.Client.exe --server 1.2.3.4:5600 --key C:\keys\client1\client-private.pe
   успешного Auth: подпись Auth проверяется по всем зарегистрированным ключам,
   чужой клиент отвергается (`[!] Auth ... подпись не соответствует ни одному
   зарегистрированному ключу`).
-- **Статистика.** Раз в минуту (и при остановке клиента) печатается строка
-  `[stats]`: `вход` — принятые пакеты/кадры, `отпр` — отправленные кадры,
-  `впрыск` — впрыснуто в игру, `перехв` — перехвачено ответов,
-  `доставлено` — ответов доставлено игроку, `плохие` — неразобранные кадры.
+- **Статистика.** Счётчики трафика отдаются в формате Prometheus на
+  `--metrics-port` (см. «Метрики Prometheus»). Периодической печати в консоль
+  больше нет: при запуске с портом метрик в баннере печатается адрес экспорта.
 
 ### Linux
 
@@ -381,6 +390,90 @@ dotnet Proxify.Server.dll --config /etc/proxify/server.yml --tunnel-port 5600
   автоматически, чтобы ответы сервера возвращались через loopback в сниффер.
 - Перехват ответов на Linux выполняется raw IP-сокетом протокола UDP
   (`SOCK_RAW` + `IPPROTO_UDP`) вместо Windows `SIO_RCVALL`.
+
+## Метрики Prometheus
+
+Оба процесса умеют отдавать метрики в текстовом формате exposition
+(`text/plain; version=0.0.4`). Экспорт включается опцией `--metrics-port <порт>`
+(`-m`) при запуске; без неё эндпоинт не поднимается, а счётчики просто
+накапливаются в памяти.
+
+```powershell
+# машина A
+Proxify.Server.exe --config server.yml --tunnel-port 5600 --metrics-port 9100
+# машина B
+Proxify.Client.exe --server 1.2.3.4:5600 --key client-private.pem --metrics-port 9101
+```
+
+Эндпоинты на указанном порту (слушают все интерфейсы):
+
+| Путь | Ответ |
+|------|-------|
+| `GET /metrics` | текстовая экспозиция метрик |
+| `HEAD /metrics` | те же заголовки без тела |
+| `GET /-/healthy`, `GET /healthz` | `ok` |
+| прочие пути | `404`, прочие методы — `405` |
+
+Keep-Alive не поддерживается: каждый сбор — отдельное соединение, ответ всегда
+закрывает его. Соединение закрывается штатно, поэтому RST и «пустой ответ» у
+сборщика не возникают.
+
+### Что отдаётся
+
+Метрики уровня процесса (без меток):
+
+| Метрика | Тип | Смысл |
+|---------|-----|-------|
+| `proxify_up` | gauge | `1`, пока процесс работает |
+| `proxify_start_time_seconds` | gauge | момент запуска (Unix-время) |
+| `proxify_build_info{version,role}` | gauge | версия и роль процесса (`server`/`client`), значение всегда `1` |
+| `proxify_tunnel_port` | gauge | порт туннеля из аргументов запуска |
+| `proxify_tunnel_unauthorized_frames_total` | counter | кадры, не прошедшие авторизацию |
+| `proxify_tunnel_work_queue_depth` | gauge | задач в очереди фоновой обработки |
+| `proxify_metrics_up` | gauge | `1`, если экспортёр отдаёт данные |
+| `proxify_metrics_scrapes_total` | counter | успешных сборов |
+| `proxify_metrics_scrape_errors_total` | counter | неудачных сборов |
+| `proxify_metrics_scrape_duration_seconds` | histogram | длительность сборов |
+
+Метрики туннеля. На прокси-сервере у них есть метка `client` с именем правила из
+`server.yml`, на прокси-клиенте меток нет (клиент обслуживает одно правило):
+
+| Метрика | Тип | Смысл |
+|---------|-----|-------|
+| `proxify_tunnel_packets_in_total` | counter | принято пакетов и кадров |
+| `proxify_tunnel_packets_out_total` | counter | отправлено кадров в туннель |
+| `proxify_tunnel_bytes_in_total` | counter | принято байт трафика |
+| `proxify_tunnel_bytes_out_total` | counter | отправлено байт в туннель |
+| `proxify_tunnel_frames_injected_total` | counter | кадров, впрыснуто в игру |
+| `proxify_tunnel_replies_captured_total` | counter | перехвачено ответов игрового сервера |
+| `proxify_tunnel_replies_relayed_total` | counter | ответов доставлено игроку |
+| `proxify_tunnel_bad_frames_total` | counter | неразобранные или не прошедшие проверку кадры |
+| `proxify_tunnel_authorized` | gauge | сессия авторизована (`1`/`0`) |
+| `proxify_tunnel_players` | gauge | известных игроков (UDP) или активных соединений (TCP) |
+| `proxify_tunnel_frame_bytes` | histogram | распределение размеров кадров туннеля |
+
+«Живые» величины (`proxify_tunnel_players`, `proxify_tunnel_authorized`,
+`proxify_tunnel_work_queue_depth`) опрашиваются раз в секунду, пока экспорт
+включён, — иначе опрос каждого пакета стоил бы дороже самих метрик.
+
+### Подключение к Prometheus
+
+```yaml
+scrape_configs:
+  - job_name: proxify
+    scrape_interval: 15s
+    static_configs:
+      - targets: ['1.2.3.4:9100', '1.2.3.4:9101']
+```
+
+Проверить вручную:
+
+```bash
+curl -s http://127.0.0.1:9100/metrics | head
+```
+
+Формат экспозиции и HTTP-эндпоинты проверяет `dotnet run --project
+Proxify.SelfTest` (права администратора для этой части не нужны).
 
 ## Проверка
 
@@ -585,7 +678,11 @@ Proxify.Common/
   LoopbackAliasManager.cs  добавление/удаление IP игроков на loopback (WinAPI / ip)
   NetUtils.cs              вспомогательные утилиты (разбор ip:port, портов, флагов)
   ArgParser.cs             разбор аргументов --имя значение (обязательные/дефолты/--help)
-  TunnelStats.cs           счётчики трафика и строка [stats]
+  Metrics/Metric.cs, MetricLabels.cs, MetricsExposition.cs  метрики, метки, формат exposition
+  Metrics/Counter.cs, Gauge.cs, Histogram.cs  счётчик, гау, гистограмма (серии по значениям меток)
+  Metrics/MetricsRegistry.cs  реестр метрик: регистрация и сбор в текст
+  Metrics/TunnelMetrics.cs    доменные метрики туннеля и ручки по правилам
+  Metrics/MetricsExporter.cs  HTTP-экспорт /metrics (GET/HEAD), /-/healthy
   AsyncWorkQueue.cs        ограниченная очередь задач с пулом воркеров (параллельная обработка)
   TcpFrameBatcher.cs       HTTP-ориентированное объединение TCP-фрагментов в кадры (HTTP, chunked, SSE)
   TcpReliableSender.cs     надёжная отправка TcpData: буфер неподтверждённых кадров, повтор ~50 мс, окно ~512

@@ -21,6 +21,12 @@ public sealed record ServerOptions
 
     public int TunnelPort { get; init; }
 
+    /// <summary>
+    /// TCP-порт экспорта метрик Prometheus. null — метрики выключены (опция
+    /// --metrics-port не задана), эндпоинт /metrics не поднимается.
+    /// </summary>
+    public int? MetricsPort { get; init; }
+
     /// <summary>Путь к YAML-конфигу (для диагностики).</summary>
     public string ConfigPath { get; init; } = "";
 

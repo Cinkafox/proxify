@@ -19,6 +19,10 @@ var gameIp = IPAddress.Loopback;
 
 var failures = 0;
 
+// Метрики проверяются первыми и не требуют прав администратора: полезно знать,
+// что экспорт и формат exposition в порядке, даже если RawSocket недоступен.
+failures += MetricsSelfTest.Run();
+
 try
 {
     // 1. Игровой UDP-сервер на 127.0.0.1:7777

@@ -3,6 +3,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Threading.Channels;
 using Proxify.Common.Crypto;
+using Proxify.Common.Metrics;
 using Proxify.Common.Protocol;
 using Proxify.Common.Sessions;
 using Proxify.Common.Tcp;
@@ -50,7 +51,7 @@ public sealed class TcpRelay : IDisposable
     private readonly IPEndPoint _proxyServer;
     private readonly Func<TunnelCipher?> _cipherGetter;
     private readonly WireObfuscator? _wire;
-    private readonly TunnelStats _stats;
+    private readonly TunnelMetricsHandle _metrics;
     private readonly ServerTcpStatus _serverTcp;
     private readonly ConcurrentDictionary<uint, TcpSession> _sessions = new();
     private int _disabledWarned;
@@ -61,7 +62,7 @@ public sealed class TcpRelay : IDisposable
         UdpClient tunnel,
         IPEndPoint proxyServer,
         Func<TunnelCipher?> cipherGetter,
-        TunnelStats stats,
+        TunnelMetricsHandle metrics,
         ServerTcpStatus serverTcp,
         WireObfuscator? wire)
     {
@@ -70,10 +71,13 @@ public sealed class TcpRelay : IDisposable
         _tunnel = tunnel;
         _proxyServer = proxyServer;
         _cipherGetter = cipherGetter;
-        _stats = stats;
+        _metrics = metrics;
         _serverTcp = serverTcp;
         _wire = wire;
     }
+
+    /// <summary>Число соединений с игровым сервером (для метрик).</summary>
+    public int ActiveConnectionCount => _sessions.Count;
 
     /// <summary>
     /// Обрабатывает TCP-кадр (TcpOpen/TcpData/TcpClose/TcpAck), полученный из туннеля.
@@ -109,12 +113,12 @@ public sealed class TcpRelay : IDisposable
         var cipher = _cipherGetter();
         if (cipher == null || !Frame.TryDecodeTcpOpen(buffer, length, cipher, out _, out _, out var connId))
         {
-            Interlocked.Increment(ref _stats.BadFrames);
+            _metrics.CountBadFrame();
             Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Не удалось разобрать TcpOpen.");
             return;
         }
 
-        var session = new TcpSession(connId, _gameIp, _gamePort, _tunnel, _proxyServer, _cipherGetter, _stats, this, _wire);
+        var session = new TcpSession(connId, _gameIp, _gamePort, _tunnel, _proxyServer, _cipherGetter, _metrics, this, _wire);
         if (_sessions.TryAdd(connId, session))
         {
             _ = Task.Run(session.RunAsync);
@@ -131,11 +135,11 @@ public sealed class TcpRelay : IDisposable
         var cipher = _cipherGetter();
         if (cipher == null || !Frame.TryDecodeTcpData(buffer, length, cipher, out var connId, out var seq, out var payload))
         {
-            Interlocked.Increment(ref _stats.BadFrames);
+            _metrics.CountBadFrame();
             return;
         }
 
-        Interlocked.Increment(ref _stats.PacketsIn);
+        _metrics.CountPacketsIn(payload.Length);
         if (_sessions.TryGetValue(connId, out var session))
         {
             session.ReceiveFromTunnel(seq, payload);
@@ -151,7 +155,7 @@ public sealed class TcpRelay : IDisposable
         var cipher = _cipherGetter();
         if (cipher == null || !Frame.TryDecodeTcpAck(buffer, length, cipher, out var connId, out var ackSeq))
         {
-            Interlocked.Increment(ref _stats.BadFrames);
+            _metrics.CountBadFrame();
             return;
         }
 
@@ -166,7 +170,7 @@ public sealed class TcpRelay : IDisposable
         var cipher = _cipherGetter();
         if (cipher == null || !Frame.TryDecodeTcpClose(buffer, length, cipher, out var connId))
         {
-            Interlocked.Increment(ref _stats.BadFrames);
+            _metrics.CountBadFrame();
             return;
         }
 
@@ -192,7 +196,7 @@ public sealed class TcpRelay : IDisposable
         private readonly IPEndPoint _proxyServer;
         private readonly Func<TunnelCipher?> _cipherGetter;
         private readonly WireObfuscator? _wire;
-        private readonly TunnelStats _stats;
+        private readonly TunnelMetricsHandle _metrics;
         private readonly TcpRelay _relay;
         private readonly TcpReliableSender _sender;
         private readonly TcpReliableReceiver _receiver;
@@ -210,7 +214,7 @@ public sealed class TcpRelay : IDisposable
             UdpClient tunnel,
             IPEndPoint proxyServer,
             Func<TunnelCipher?> cipherGetter,
-            TunnelStats stats,
+            TunnelMetricsHandle metrics,
             TcpRelay relay,
             WireObfuscator? wire)
         {
@@ -220,7 +224,7 @@ public sealed class TcpRelay : IDisposable
             _tunnel = tunnel;
             _proxyServer = proxyServer;
             _cipherGetter = cipherGetter;
-            _stats = stats;
+            _metrics = metrics;
             _relay = relay;
             _wire = wire;
             _sender = new TcpReliableSender(connId, SendTcpDataFrame);
@@ -286,7 +290,7 @@ public sealed class TcpRelay : IDisposable
                         break;
 
                     await stream.WriteAsync(data);
-                    Interlocked.Increment(ref _stats.Injected);
+                    _metrics.CountInjected();
                 }
             }
             catch (Exception ex)
@@ -354,9 +358,10 @@ public sealed class TcpRelay : IDisposable
                 return;
 
             var frame = Frame.EncodeTcpData(connId, seq, payload, cipher);
-            _tunnel.Send(_wire?.Wrap(frame) ?? frame, _proxyServer);
-            Interlocked.Increment(ref _stats.PacketsOut);
-            Interlocked.Increment(ref _stats.RepliesRelayed);
+            var sealedFrame = _wire?.Wrap(frame) ?? frame;
+            _tunnel.Send(sealedFrame, _proxyServer);
+            _metrics.CountPacketsOut(sealedFrame.Length);
+            _metrics.CountRepliesRelayed();
         }
 
         /// <summary>

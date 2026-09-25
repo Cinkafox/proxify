@@ -3,6 +3,7 @@ using System.Net.Sockets;
 using System.Security.Cryptography;
 using Proxify.Client.Tcp;
 using Proxify.Common.Config;
+using Proxify.Common.Metrics;
 using Proxify.Common.Crypto;
 using Proxify.Common.Protocol;
 using Proxify.Common.Sessions;
@@ -24,13 +25,17 @@ public sealed class TcpProxySession : ProxySession
         ECDsa identityKey,
         UdpClient tunnel,
         WireObfuscator? wire,
-        TunnelStats stats,
+        TunnelMetricsHandle metrics,
         AsyncWorkQueue work,
         TunnelCipher cipher,
-        ClientConfig config)
-        : base(proxyServer, identityKey, tunnel, wire, stats, work, cipher, config)
+        ClientConfig config,
+        TunnelMetrics processMetrics)
+        : base(proxyServer, identityKey, tunnel, wire, metrics, work, cipher, config, processMetrics)
     {
     }
+
+    /// <summary>Соединения с игровым сервером, открытые прокси-сервером.</summary>
+    public override int PlayersCount => _tcpRelay?.ActiveConnectionCount ?? 0;
 
     protected override void PrintProtocolBanner(ClientConfig config)
     {
@@ -41,7 +46,7 @@ public sealed class TcpProxySession : ProxySession
     protected override void CreateComponents(CancellationToken ct)
     {
         var config = Config!;
-        _tcpRelay = new TcpRelay(config.GameIp, config.GamePort, Tunnel, ProxyServer, () => Cipher, Stats, ServerTcp, Wire);
+        _tcpRelay = new TcpRelay(config.GameIp, config.GamePort, Tunnel, ProxyServer, () => Cipher, Metrics, ServerTcp, Wire);
     }
 
     protected override IEnumerable<Task> CreateProtocolTasks(CancellationToken ct) => Array.Empty<Task>();
@@ -54,7 +59,7 @@ public sealed class TcpProxySession : ProxySession
             return Task.CompletedTask;
         }
 
-        Interlocked.Increment(ref Stats.BadFrames);
+        Metrics.CountBadFrame();
         Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Получен посторонний кадр у TCP-правила (кадр данных?).");
         return Task.CompletedTask;
     }

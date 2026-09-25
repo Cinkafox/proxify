@@ -2,6 +2,7 @@
 using System.Text;
 using Proxify.Client.Cli;
 using Proxify.Client.Sessions;
+using Proxify.Common.Metrics;
 
 Console.OutputEncoding = Encoding.UTF8;
 
@@ -28,10 +29,15 @@ if (options.KeygenDir != null)
     return 0;
 }
 
-var session = await ProxySession.CreateAsync(options.ProxyServer, options.IdentityKey, options.LocalPort, options.WireObfuscation);
+// Метрики Prometheus. Без --metrics-port экспорт не поднимается: счётчики
+// накапливаются, но никто их не забирает.
+using var metrics = new TunnelMetrics(MetricsRole.Client, perClientLabels: false);
+
+var session = await ProxySession.CreateAsync(options.ProxyServer, options.IdentityKey, options.LocalPort, options.WireObfuscation, metrics);
 if (session == null)
     return 1;
 
+using var exporter = TryStartExporter(metrics, options.MetricsPort);
 using (session)
 {
     try
@@ -60,3 +66,18 @@ using (session)
 }
 
 return 0;
+
+// Поднимает экспорт метрик, если задан --metrics-port. Порт занят — предупреждение,
+// а не отказ: прокси продолжает работать без метрик.
+static MetricsExporter? TryStartExporter(TunnelMetrics metrics, int? metricsPort)
+{
+    try
+    {
+        return MetricsExporter.TryStart(metrics, metricsPort);
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[warn] Метрики Prometheus выключены: {ex.Message}");
+        return null;
+    }
+}

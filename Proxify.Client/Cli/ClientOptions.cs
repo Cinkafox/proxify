@@ -30,4 +30,10 @@ public sealed record ClientOptions
     public int? LocalPort { get; init; }
 
     public bool WireObfuscation { get; init; }
+
+    /// <summary>
+    /// TCP-порт экспорта метрик Prometheus. null — метрики выключены (опция
+    /// --metrics-port не задана), эндпоинт /metrics не поднимается.
+    /// </summary>
+    public int? MetricsPort { get; init; }
 }

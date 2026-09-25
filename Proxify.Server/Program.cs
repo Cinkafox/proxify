@@ -1,4 +1,5 @@
 ﻿using System.Text;
+using Proxify.Common.Metrics;
 using Proxify.Server.Cli;
 using Proxify.Server.Core;
 
@@ -27,18 +28,34 @@ if (options.ConfiggenDir != null)
     return 0;
 }
 
-using var server = new ProxyServer(options.Clients, options.TunnelPort);
-using var statsTimer = new Timer(_ => server.Stats.Print("прокси-сервер"), null, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(1));
+// Метрики Prometheus. Без --metrics-port экспорт не поднимается: счётчики
+// накапливаются, но никто их не забирает.
+using var metrics = new TunnelMetrics(MetricsRole.Server, perClientLabels: true);
 
-server.PrintBanner();
-
+MetricsExporter? exporter;
 try
 {
-    await server.RunAsync();
+    exporter = MetricsExporter.TryStart(metrics, options.MetricsPort);
 }
 catch (Exception ex)
 {
-    Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [ошибка] {ex.Message}");
+    Console.WriteLine($"[ошибка конфигурации] {ex.Message}");
+    return 1;
+}
+
+using (exporter)
+using (var server = new ProxyServer(options.Clients, options.TunnelPort, metrics))
+{
+    server.PrintBanner();
+
+    try
+    {
+        await server.RunAsync();
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [ошибка] {ex.Message}");
+    }
 }
 
 return 0;

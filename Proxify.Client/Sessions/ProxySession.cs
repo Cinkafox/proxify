@@ -5,6 +5,7 @@ using System.Security.Cryptography;
 using Proxify.Client.Tcp;
 using Proxify.Common.Config;
 using Proxify.Common.Crypto;
+using Proxify.Common.Metrics;
 using Proxify.Common.Protocol;
 using Proxify.Common.Sessions;
 
@@ -41,9 +42,22 @@ public abstract class ProxySession : SharedProxySession
     private long _lastPongTicks;
     private byte[] _lastPingToken = Array.Empty<byte>();
 
+    private readonly TunnelMetrics _processMetrics;
+
     public IPEndPoint ProxyServer { get; }
     public override TunnelCipher? Cipher { get; protected set; }
     public override ClientConfig? Config { get; protected set; }
+
+    /// <summary>
+    /// Реестр метрик процесса: его отдаёт наружу экспортёр (--metrics-port).
+    /// </summary>
+    public TunnelMetrics ProcessMetrics => _processMetrics;
+
+    /// <summary>
+    /// Число игроков (UDP-правило) или активных соединений с игровым сервером
+    /// (TCP-правило) — источник гаужа <c>proxify_tunnel_players</c>.
+    /// </summary>
+    public abstract int PlayersCount { get; }
 
     /// <summary>
     /// Признак включённого TCP-проксирования на прокси-сервере.
@@ -60,18 +74,34 @@ public abstract class ProxySession : SharedProxySession
         ECDsa identityKey,
         UdpClient tunnel,
         WireObfuscator? wire,
-        TunnelStats stats,
+        TunnelMetricsHandle metrics,
         AsyncWorkQueue work,
         TunnelCipher cipher,
-        ClientConfig config)
-        : base(tunnel, stats, work, wire)
+        ClientConfig config,
+        TunnelMetrics processMetrics)
+        : base(tunnel, metrics, work, wire)
     {
         ProxyServer = proxyServer;
         _identityKey = identityKey;
+        _processMetrics = processMetrics;
         Cipher = cipher;
         Config = config;
         ServerTcp.Set(config.Protocol == TunnelProtocol.Tcp);
+        // Сессия создаётся только после успешного Auth, поэтому она авторизована.
+        Metrics.SetAuthorized(true);
+        _processMetrics.AddRefreshCallback(RefreshMetrics);
         Interlocked.Exchange(ref _lastPongTicks, DateTime.UtcNow.Ticks);
+    }
+
+    /// <summary>
+    /// Обновляет «живые» гаужи метрик: число игроков, глубину очереди обработки и
+    /// признак авторизации. Вызывается по таймеру, только если метрики включены.
+    /// </summary>
+    private void RefreshMetrics()
+    {
+        Metrics.SetPlayers(PlayersCount);
+        Metrics.SetQueueDepth(Work.PendingCount);
+        Metrics.SetAuthorized(Cipher != null);
     }
 
     /// <summary>
@@ -85,8 +115,10 @@ public abstract class ProxySession : SharedProxySession
         IPEndPoint proxyServer,
         ECDsa identityKey,
         int? localPort = null,
-        bool wireObfuscation = false)
+        bool wireObfuscation = false,
+        TunnelMetrics? metrics = null)
     {
+        metrics ??= new TunnelMetrics(MetricsRole.Client, perClientLabels: false);
         var tunnel = new UdpClient();
         try
         {
@@ -101,7 +133,10 @@ public abstract class ProxySession : SharedProxySession
         }
 
         var wire = wireObfuscation ? WireObfuscator.Create(identityKey, weAreClient: true) : null;
-        var stats = new TunnelStats();
+
+        // До рукопожатия конфиг правила ещё неизвестен, поэтому плохие кадры
+        // рукопожатия считаем на уровне процесса.
+        var authMetrics = metrics.Process;
         var work = new AsyncWorkQueue(Math.Clamp(Environment.ProcessorCount, 2, 8));
 
         Console.WriteLine("[auth] Авторизация на прокси-сервере...");
@@ -147,7 +182,7 @@ public abstract class ProxySession : SharedProxySession
                     {
                         if (!wire.TryUnwrap(data, data.Length, out var inner))
                         {
-                            Interlocked.Increment(ref stats.BadFrames);
+                            authMetrics.CountBadFrame();
                             continue;
                         }
                         data = inner;
@@ -166,12 +201,13 @@ public abstract class ProxySession : SharedProxySession
                                           $"capture={(config.CaptureReplies ? "вкл" : "выкл")}, aliases={(config.LoopbackAliases ? "вкл" : "выкл")}, " +
                                           $"protocol={config.Protocol}.");
 
+                        var sessionMetrics = metrics.ForClient($"{config!.GameIp}:{config.GamePort}");
                         return config.Protocol == TunnelProtocol.Tcp
-                            ? new TcpProxySession(proxyServer, identityKey, tunnel, wire, stats, work, cipher!, config)
-                            : new UdpProxySession(proxyServer, identityKey, tunnel, wire, stats, work, cipher!, config)!;
+                            ? new TcpProxySession(proxyServer, identityKey, tunnel, wire, sessionMetrics, work, cipher!, config, metrics)
+                            : new UdpProxySession(proxyServer, identityKey, tunnel, wire, sessionMetrics, work, cipher!, config, metrics)!;
                     }
 
-                    Interlocked.Increment(ref stats.BadFrames);
+                    authMetrics.CountBadFrame();
                     Console.WriteLine("[auth] [!] AuthAck не прошёл проверку (неверный echo nonce или ключ).");
                 }
             }
@@ -218,8 +254,6 @@ public abstract class ProxySession : SharedProxySession
         PrintBanner();
         CreateComponents(cts.Token);
 
-        using var statsTimer = new Timer(_ => Stats.Print("прокси-клиент"), null, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(1));
-
         Console.WriteLine("Ожидание кадров от прокси-сервера...");
         Console.WriteLine("Нажмите Ctrl+C для остановки.");
         Console.WriteLine();
@@ -234,7 +268,6 @@ public abstract class ProxySession : SharedProxySession
         }
         finally
         {
-            Stats.Print("прокси-клиент");
             // Дожидаемся обработки оставшихся в очереди пакетов перед закрытием сокетов.
             await Work.WaitForDrainAsync();
             DisposeComponents();
@@ -264,6 +297,7 @@ public abstract class ProxySession : SharedProxySession
         Console.WriteLine($"Прокси-сервер (машина A) : {ProxyServer}");
         PrintProtocolBanner(config);
         Console.WriteLine("Шифрование туннеля        : ECDSA P-256 + ECDH P-256 + AES-256-GCM (сессионный ключ)");
+        Console.WriteLine($"Метрики Prometheus         : {(_processMetrics.Enabled ? $"вкл — {_processMetrics.ExpositionUrl}" : "выкл (задайте --metrics-port, чтобы включить)")}");
         Console.WriteLine($"Маскировка датаграмм      : {(Wire != null
             ? "внешний AEAD-слой от ключа клиента (на проводе только случайные байты)"
             : "ВЫКЛЮЧЕНА (кадры видны в внутреннем формате; должна совпадать с сервером)")}");
@@ -372,13 +406,14 @@ public abstract class ProxySession : SharedProxySession
         ClientConfig? config;
         if (!TryParseAuthAck(buffer, length, nonce, ephemeral, out cipher, out config))
         {
-            Interlocked.Increment(ref Stats.BadFrames);
+            Metrics.CountBadFrame();
             Console.WriteLine("[auth] [!] AuthAck не прошёл проверку (неверный echo nonce или ключ).");
             return;
         }
 
         Cipher = cipher;
         Config = config;
+        Metrics.SetAuthorized(true);
         ServerTcp.Set(config!.Protocol == TunnelProtocol.Tcp);
         Interlocked.Exchange(ref _lastPongTicks, DateTime.UtcNow.Ticks);
 
@@ -429,7 +464,7 @@ public abstract class ProxySession : SharedProxySession
                 {
                     if (Frame.PeekFrameType(result.Buffer, result.Buffer.Length) != null)
                         Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Получен немаскированный кадр — на сервере выключена обфускация (obfuscation=false) или старая версия ПО.");
-                    Interlocked.Increment(ref Stats.BadFrames);
+                    Metrics.CountBadFrame();
                     continue;
                 }
             }
@@ -439,7 +474,7 @@ public abstract class ProxySession : SharedProxySession
                 if (Frame.PeekFrameType(data, data.Length) == null)
                 {
                     Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Получена датаграмма без распознаваемого кадра — на сервере включена обфускация, а у клиента она отключена (--wire-obfuscation off).");
-                    Interlocked.Increment(ref Stats.BadFrames);
+                    Metrics.CountBadFrame();
                     continue;
                 }
             }
