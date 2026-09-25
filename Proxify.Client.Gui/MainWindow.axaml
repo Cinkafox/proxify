@@ -1,0 +1,124 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="Proxify.Client.Gui.MainWindow"
+        Title="Proxify Client"
+        Width="880" Height="660"
+        MinWidth="760" MinHeight="560"
+        WindowStartupLocation="CenterScreen">
+
+    <Window.Styles>
+        <Style Selector="TextBox.mono">
+            <Setter Property="FontFamily" Value="Consolas, DejaVu Sans Mono, monospace" />
+            <Setter Property="AcceptsReturn" Value="True" />
+            <Setter Property="TextWrapping" Value="NoWrap" />
+        </Style>
+        <Style Selector="Border.group">
+            <Setter Property="BorderBrush" Value="#999999" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="CornerRadius" Value="4" />
+            <Setter Property="Padding" Value="8" />
+        </Style>
+        <Style Selector="TextBlock.groupHeader">
+            <Setter Property="FontWeight" Value="SemiBold" />
+            <Setter Property="Margin" Value="0,0,0,6" />
+        </Style>
+    </Window.Styles>
+
+    <TabControl>
+        <!-- Вкладка «Клиент» -->
+        <TabItem Header="Клиент">
+            <Grid RowDefinitions="Auto,175,Auto,*" Margin="8">
+
+                <!-- Подключение -->
+                <Border Classes="group">
+                    <StackPanel Spacing="4" Margin="2">
+                        <TextBlock Classes="groupHeader" Text="Подключение к прокси-серверу (машина A)" />
+                        <Grid ColumnDefinitions="200,*" RowDefinitions="Auto,Auto,Auto">
+                            <TextBlock Grid.Row="0" Grid.Column="0"
+                                       Text="Адрес сервера (IP или хост):"
+                                       VerticalAlignment="Center" Margin="0,0,8,4" />
+                            <TextBox Grid.Row="0" Grid.Column="1"
+                                     x:Name="HostBox"
+                                     Watermark="IP или хост машины A" Margin="0,0,0,4" />
+                            <TextBlock Grid.Row="1" Grid.Column="0"
+                                       Text="Порт туннеля UDP:"
+                                       VerticalAlignment="Center" Margin="0,0,8,4" />
+                            <TextBox Grid.Row="1" Grid.Column="1"
+                                     x:Name="TunnelPortBox"
+                                     Watermark="1–65535" Margin="0,0,0,4" />
+                            <TextBlock Grid.Row="2" Grid.Column="0"
+                                       Text="Маскировка туннеля:"
+                                       VerticalAlignment="Center" Margin="0,0,8,4" />
+                            <CheckBox Grid.Row="2" Grid.Column="1"
+                                      x:Name="WireObfuscationBox"
+                                      Content="Внешняя маскировка (совпадать с &quot;obfuscation&quot; на сервере)"
+                                      VerticalAlignment="Center" />
+                        </Grid>
+                    </StackPanel>
+                </Border>
+
+                <!-- Закрытый ключ -->
+                <Border Classes="group" Grid.Row="1">
+                    <Grid RowDefinitions="*,Auto" Margin="2">
+                        <TextBox Classes="mono" x:Name="PrivateKeyBox" />
+                        <StackPanel Grid.Row="1" Orientation="Horizontal" Spacing="12" Margin="0,6,0,0">
+                            <Button x:Name="LoadKeyButton" Content="Загрузить из файла…" />
+                            <TextBlock Text="Формат: PEM PKCS#8 (файл client-private.pem)"
+                                       Foreground="Gray" VerticalAlignment="Center" />
+                        </StackPanel>
+                    </Grid>
+                </Border>
+
+                <!-- Запуск / остановка -->
+                <StackPanel Grid.Row="2" Orientation="Horizontal" Spacing="8" Margin="0,8,0,8">
+                    <Button x:Name="StartButton" Content="Запустить" />
+                    <Button x:Name="StopButton" Content="Остановить" IsEnabled="False" />
+                    <TextBlock x:Name="StatusText" Text="Статус: остановлен"
+                               VerticalAlignment="Center" Margin="8,0,0,0" />
+                </StackPanel>
+
+                <!-- Журнал -->
+                <Border Classes="group" Grid.Row="3">
+                    <Grid RowDefinitions="Auto,*" Margin="2">
+                        <TextBlock Classes="groupHeader" Text="Журнал" />
+                        <TextBox Classes="mono" x:Name="LogBox" Grid.Row="1"
+                                 IsReadOnly="True" TextWrapping="Wrap" />
+                    </Grid>
+                </Border>
+
+            </Grid>
+        </TabItem>
+
+        <!-- Вкладка «Генерация ключей» -->
+        <TabItem Header="Генерация ключей">
+            <Grid RowDefinitions="Auto,Auto,*,*" Margin="8">
+
+                <TextBlock TextWrapping="Wrap" Margin="4,4,4,8"
+                           Text="Пара ключей ECDSA P-256 для аутентификации клиента. Отправьте открытый ключ (client-public.pem) администратору машины A — он должен быть указан в конфиге сервера." />
+
+                <StackPanel Grid.Row="1" Orientation="Horizontal" Spacing="6" Margin="4,0,4,8">
+                    <Button x:Name="GenerateButton" Content="Сгенерировать пару ключей" />
+                    <Button x:Name="SavePrivateKeyButton" Content="Сохранить закрытый…" IsEnabled="False" />
+                    <Button x:Name="SavePublicKeyButton" Content="Сохранить открытый…" IsEnabled="False" />
+                    <Button x:Name="UseKeyButton" Content="Перенести закрытый ключ в поле клиента" IsEnabled="False" />
+                </StackPanel>
+
+                <Border Classes="group" Grid.Row="2">
+                    <Grid RowDefinitions="Auto,*" Margin="2">
+                        <TextBlock Classes="groupHeader" Text="Закрытый ключ (PKCS#8 PEM)" />
+                        <TextBox Classes="mono" x:Name="GenPrivateBox" Grid.Row="1" IsReadOnly="True" />
+                    </Grid>
+                </Border>
+
+                <Border Classes="group" Grid.Row="3">
+                    <Grid RowDefinitions="Auto,*" Margin="2">
+                        <TextBlock Classes="groupHeader" Text="Открытый ключ (SPKI PEM)" />
+                        <TextBox Classes="mono" x:Name="GenPublicBox" Grid.Row="1" IsReadOnly="True" />
+                    </Grid>
+                </Border>
+
+            </Grid>
+        </TabItem>
+    </TabControl>
+
+</Window>
