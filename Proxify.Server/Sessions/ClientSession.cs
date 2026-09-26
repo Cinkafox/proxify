@@ -4,6 +4,7 @@ using System.Net.Sockets;
 using System.Security.Cryptography;
 using Proxify.Common.Config;
 using Proxify.Common.Crypto;
+using Proxify.Common.Quic;
 using Proxify.Common.Tcp;
 
 namespace Proxify.Server.Sessions;
@@ -63,8 +64,8 @@ public sealed class ClientSession : IDisposable
     {
         Config = config;
         RegisteredKey = TunnelKeys.ImportPublicPem(config.PublicKeyPem);
-        Wire = config.WireObfuscation
-            ? WireObfuscator.Create(RegisteredKey, weAreClient: false)
+        Wire = config.ObfuscationEnabled
+            ? WireObfuscator.Create(RegisteredKey, weAreClient: false, config.ObfuscationMode, QuicConnection.DefaultServerName)
             : null;
         if (config.Protocol == TunnelProtocol.Tcp)
             TcpListener = new TcpListener(IPAddress.Any, config.Port);
@@ -81,6 +82,10 @@ public sealed class ClientSession : IDisposable
         Interlocked.Exchange(ref _tunnelEndpoint, endpoint);
         Volatile.Write(ref _cipher, cipher);
         Interlocked.Exchange(ref _lastActivityTicks, DateTime.UtcNow.Ticks);
+
+        // Ключи пакетов 1-RTT выводятся из того же сессионного ключа, что и
+        // внутренний шифр: после рукопожатия кадры идут в потоке 1-RTT.
+        Wire?.AttachSessionKey(cipher.ExportSessionKey());
     }
 
     public void TouchActivity() => Interlocked.Exchange(ref _lastActivityTicks, DateTime.UtcNow.Ticks);

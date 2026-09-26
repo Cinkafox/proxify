@@ -13,7 +13,10 @@ param(
     [switch]$Tcp = $true,
     [switch]$NoTcp,
     # Включить внешнюю маскировку туннеля (по умолчанию выключена, как в конфигах).
-    [switch]$Obfuscation
+    [switch]$Obfuscation,
+    # Режим маскировки: off, random (прежний AEAD-конверт) или quic.
+    [ValidateSet("off", "random", "quic")]
+    [string]$ObfuscationMode = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -362,7 +365,15 @@ if (-not [string]::IsNullOrEmpty($TcpKey)) {
     $tcpIdentity.GenerateKey([System.Security.Cryptography.ECCurve+NamedCurves]::nistP256)
 }
 
-$script:useWire = $Obfuscation.IsPresent
+# Режим маскировки для теста. -Obfuscation — прежний переключатель, он равносилен
+# random. Режим quic этот скрипт не покрывает: чтобы отправлять пакеты QUIC, нужен
+# сам код клиента, поэтому его проверяет Proxify.SelfTest.
+$mode = if (-not [string]::IsNullOrEmpty($ObfuscationMode)) { $ObfuscationMode } elseif ($Obfuscation.IsPresent) { "random" } else { "off" }
+if ($mode -eq "quic") {
+    throw "Режим quic не поддерживается этим скриптом: он собирает кадры туннеля сам, а пакеты QUIC собирает клиент. Проверьте: dotnet run --project Proxify.SelfTest"
+}
+$script:wireMode = $mode
+$script:useWire = $mode -ne "off"
 
 $workDir = Join-Path $env:TEMP "proxify-test-$(Get-Random)"
 New-Item -ItemType Directory -Path $workDir | Out-Null
@@ -377,7 +388,7 @@ if ([string]::IsNullOrEmpty($configPath)) {
     Set-Content -LiteralPath $publicKeyFile -Value $publicPem -NoNewline
     Set-Content -LiteralPath $tcpPublicKeyFile -Value $tcpPublicPem -NoNewline
     $configPath = Join-Path $workDir "server.yml"
-    $obfValue = if ($script:useWire) { "true" } else { "false" }
+    $obfValue = if ($script:useWire) { "random" } else { "false" }
     $yaml = @"
 ---
 # Автоконфиг теста: каждое правило = отдельный прокси-клиент со своим ключом.
@@ -410,7 +421,8 @@ if (-not [string]::IsNullOrEmpty($TcpKey)) {
 }
 Write-Host "Порт туннеля   : $TunnelPort"
 Write-Host "Порт игроков   : UDP=$Port TCP=$TcpPort (в авто-конфиге)"
-Write-Host "Маскировка     : $(if ($script:useWire) { 'вкл (внешний AEAD-слой, -Obfuscation)' } else { 'ВЫКЛЮЧЕНА (по умолчанию)' })"
+$maskingLabel = if ($script:useWire) { 'вкл, режим ' + $mode } else { 'ВЫКЛЮЧЕНА (по умолчанию)' }
+Write-Host "Маскировка     : $maskingLabel"
 Write-Host ""
 
 $serverLog = Join-Path $workDir "server.out.log"

@@ -35,12 +35,25 @@ public static class TunnelKeys
     public const string WireInfoClientToServer = "proxify-wire-v2-c2s";
     public const string WireInfoServerToClient = "proxify-wire-v2-s2c";
 
+    /// <summary>
+    /// Базовые секреты для ключей уровня Handshake маскировки под вид QUIC. Эти
+    /// секреты — то, что делает рукопожатие туннеля неразбираемым для наблюдателя:
+    /// они выводятся из зарегистрированной пары ключей клиента, а не из публичной
+    /// соли версии QUIC, поэтому содержимое кадров CRYPTO с Auth/AuthAck
+    /// подделать или прочитать со стороны нельзя.
+    /// </summary>
+    public const string QuicInfoClientToServer = "proxify-quic-v1-c2s";
+    public const string QuicInfoServerToClient = "proxify-quic-v1-s2c";
+
     public const byte AuthVersion = 1;
 
     public const int PointSize = 32;
     public const int NonceSize = 16;
     public const int SignatureSize = 64;
     public const int SessionKeySize = 32;
+
+    /// <summary>Длина базового секрета направления для ключей Handshake.</summary>
+    public const int QuicSecretSize = 32;
 
     private static readonly byte[] AuthInfoBytes = Encoding.UTF8.GetBytes(AuthInfo);
 
@@ -154,6 +167,20 @@ public static class TunnelKeys
             HashAlgorithmName.SHA256,
             registeredSpkiDer,
             SessionKeySize,
+            Encoding.UTF8.GetBytes(WireSalt),
+            Encoding.UTF8.GetBytes(info));
+
+    /// <summary>
+    /// Выводит базовый секрет направления для маскировки под вид QUIC:
+    /// HKDF-SHA256(ikm=SPKI-DER, salt=WireSalt, info=направление). Итог — 32 байта,
+    /// столько же, сколько возвращает <see cref="DeriveSessionKey"/>, чтобы из него
+    /// можно было вывести все ключи пакетов.
+    /// </summary>
+    public static byte[] DeriveQuicSecret(byte[] registeredSpkiDer, string info)
+        => HKDF.DeriveKey(
+            HashAlgorithmName.SHA256,
+            registeredSpkiDer,
+            QuicSecretSize,
             Encoding.UTF8.GetBytes(WireSalt),
             Encoding.UTF8.GetBytes(info));
 

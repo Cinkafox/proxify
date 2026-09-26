@@ -12,8 +12,18 @@ public sealed class GuiSettings
     public string TunnelPort { get; set; } = "";
     public string KeyFilePath { get; set; } = "";
 
-    /// <summary>Внешняя маскировка туннеля (по умолчанию выключена, как в конфиге сервера).</summary>
+    /// <summary>
+    /// Прежний переключатель внешней маскировки: оставлен для совместимости со
+    /// старыми файлами настроек. Если <see cref="ObfuscationMode"/> не задан,
+    /// режим определяется этим флагом.
+    /// </summary>
     public bool WireObfuscation { get; set; }
+
+    /// <summary>Имя режима маскировки: off, random или quic.</summary>
+    public string ObfuscationMode { get; set; } = "";
+
+    /// <summary>Имя сервера для SNI в ClientHello режима quic.</summary>
+    public string QuicServerName { get; set; } = "";
 
     private static string GetPath()
     {

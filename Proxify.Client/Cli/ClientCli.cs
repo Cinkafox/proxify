@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using Proxify.Common.Cli;
 using Proxify.Common.Crypto;
+using Proxify.Common.Quic;
 using Proxify.Common.Networking;
 
 namespace Proxify.Client.Cli;
@@ -19,7 +20,8 @@ public static class ClientCli
         .Add("local-port", "Локальный UDP-порт туннеля клиента. Если не задан, ОС выберет свободный (port 0). Полезно для файрволов.", shortName: 'l')
         .Add("key", "Путь к закрытому ключу клиента (PEM, PKCS#8). Создаётся командой --keygen", shortName: 'k')
         .Add("keygen", "Сгенерировать пару ключей в указанном каталоге (client-private.pem, client-public.pem) и выйти", shortName: 'g')
-        .Add("wire-obfuscation", "Внешняя маскировка туннеля: on или off (по умолчанию). Должна совпадать с настройкой 'obfuscation' в конфиге сервера", defaultValue: "off")
+        .Add("wire-obfuscation", "Внешняя маскировка туннеля: off, random (шифрование датаграммы целиком) или quic (пакеты QUIC v1). По умолчанию off. Должна совпадать с настройкой 'obfuscation' в конфиге сервера", defaultValue: "off")
+        .Add("quic-sni", "Имя сервера в SNI расширения ClientHello режима quic", defaultValue: QuicConnection.DefaultServerName)
         .Add("metrics-port", "TCP-порт для метрик Prometheus (GET /metrics). Без этой опции метрики выключены", shortName: 'm');
 
     /// <summary>
@@ -64,8 +66,14 @@ public static class ClientCli
             localPort = lp;
         }
 
-        if (!TryParseWireObfuscation(cli.Get("wire-obfuscation"), out var wireObfuscation, out var wireError))
+        if (!TryParseWireObfuscation(cli.Get("wire-obfuscation"), out var wireMode, out var wireError))
             return new ClientOptions { Error = wireError };
+
+        // SNI нужен только режиму quic: без него ClientHello был бы безымянным, что
+        // для настоящего клиента невозможно.
+        var quicServerName = (cli.Get("quic-sni") ?? QuicConnection.DefaultServerName).Trim();
+        if (wireMode == WireObfuscationMode.Quic && quicServerName.Length == 0)
+            return new ClientOptions { Error = "'--quic-sni' не может быть пустым." };
 
         // Метрики необязательны: без опции экспорт не запускается вовсе.
         int? metricsPort = null;
@@ -93,7 +101,8 @@ public static class ClientCli
             KeyPath = keyPath,
             IdentityKey = identityKey,
             LocalPort = localPort,
-            WireObfuscation = wireObfuscation,
+            WireObfuscationMode = wireMode,
+            QuicServerName = quicServerName,
             MetricsPort = metricsPort,
         };
     }
@@ -132,7 +141,11 @@ public static class ClientCli
         }
     }
 
-    private static bool TryParseWireObfuscation(string? text, out bool value, out string? error)
+    /// <summary>
+    /// Разбирает --wire-obfuscation. Прежние on/off/true/false сохранены как
+    /// синонимы random/off, чтобы старые команды и скрипты работали как раньше.
+    /// </summary>
+    private static bool TryParseWireObfuscation(string? text, out WireObfuscationMode mode, out string? error)
     {
         switch ((text ?? "off").Trim().ToLowerInvariant())
         {
@@ -140,19 +153,27 @@ public static class ClientCli
             case "вкл":
             case "true":
             case "1":
-                value = true;
+            case "random":
+                mode = WireObfuscationMode.Random;
                 error = null;
                 return true;
             case "off":
             case "выкл":
             case "false":
             case "0":
-                value = false;
+            case "none":
+                mode = WireObfuscationMode.Off;
+                error = null;
+                return true;
+            case "quic":
+            case "http3":
+            case "h3":
+                mode = WireObfuscationMode.Quic;
                 error = null;
                 return true;
             default:
-                value = false;
-                error = "--wire-obfuscation принимает только on|off.";
+                mode = WireObfuscationMode.Off;
+                error = "--wire-obfuscation принимает off|random|quic (прежние on|off тоже допустимы).";
                 return false;
         }
     }

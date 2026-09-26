@@ -319,12 +319,14 @@ public static class ServerConfig
                     break;
 
                 case "obfuscation":
-                    if (!TryBool(value, out var obfuscation))
+                    if (!TryParseObfuscation(value, out var obfuscation))
                     {
-                        error = $"Конфиг '{configPath}', правило '{ruleKey}': 'obfuscation' должен быть true или false.";
+                        error = $"Конфиг '{configPath}', правило '{ruleKey}': 'obfuscation' должен быть true, false или именем режима (off, random, quic).";
                         return false;
                     }
-                    result.WireObfuscation = obfuscation;
+
+                    // Булево поле остаётся только для чтения прежним кодом.
+                    result.ObfuscationMode = obfuscation;
                     break;
 
                 default:
@@ -352,6 +354,36 @@ public static class ServerConfig
 
         client = result;
         return true;
+    }
+
+    /// <summary>
+    /// Разбирает 'obfuscation'. Прежние true/false/yes/no/on/off/0/1 сохраняют
+    /// прежнее поведение (шифрование датаграммы целиком либо его отсутствие),
+    /// дополнительно принимаются имена режимов: random и quic.
+    /// </summary>
+    private static bool TryParseObfuscation(YamlValue value, out WireObfuscationMode mode)
+    {
+        mode = WireObfuscationMode.Off;
+        if (value.Kind != YamlKind.Scalar)
+            return false;
+
+        if (TryBool(value, out var flag))
+        {
+            mode = flag ? WireObfuscationMode.Random : WireObfuscationMode.Off;
+            return true;
+        }
+
+        switch (value.Scalar.Trim().ToLowerInvariant())
+        {
+            case "random":
+                mode = WireObfuscationMode.Random;
+                return true;
+            case "quic":
+                mode = WireObfuscationMode.Quic;
+                return true;
+            default:
+                return false;
+        }
     }
 
     private static bool TryBool(YamlValue value, out bool result)

@@ -90,7 +90,7 @@ var protocol = client.Config.Protocol == TunnelProtocol.Tcp
             : $"UDP (порт {client.Config.Port} -> игра {client.Config.GameIp}:{client.Config.GamePort})";
             Console.WriteLine($"  Клиент '{client.DisplayName}':");
             Console.WriteLine($"    правило: {protocol}");
-            Console.WriteLine($"    маскировка туннеля: {(client.Config.WireObfuscation ? "вкл" : "выкл")}");
+            Console.WriteLine($"    маскировка туннеля: {DescribeMode(client.Config.ObfuscationMode)}");
             Console.WriteLine($"    публичный ключ: {DescribeKey(client.Config.PublicKeyPem)}");
             Console.WriteLine($"    статус        : {(client.Cipher == null ? "ждёт авторизации" : "сессия активна")}");
         }
@@ -148,8 +148,16 @@ var protocol = client.Config.Protocol == TunnelProtocol.Tcp
 
                 if (candidate.Client.Wire != null)
                 {
-                    if (!candidate.Client.Wire.TryUnwrap(data, data.Length, out inner))
+                    var outcome = candidate.Client.Wire.Unwrap(data, data.Length, out inner);
+
+                    // Датаграмма не наша: ключ чужой или режим не совпадает. В режиме
+                    // quic служебный пакет (ACK, PING, CRYPTO) тоже не даёт кадра,
+                    // но это уже наш трафик — перебор кандидатов продолжать нельзя.
+                    if (outcome == WireOutcome.Unknown)
                         continue;
+
+                    if (outcome == WireOutcome.Handshake || outcome == WireOutcome.Closed)
+                        return;
                 }
                 else
                 {
@@ -169,16 +177,16 @@ var protocol = client.Config.Protocol == TunnelProtocol.Tcp
                         await candidate.HandleFrameAsync(from, inner);
                         return;
                     }
-                    
+
                     continue;
                 }
-                
+
                 if (HandleAuthFrame(candidate, from, inner))
                     return;
             }
 
             Metrics.UnauthorizedFrames.Inc();
-            LogUnknownFrame(from);
+            LogUnknownFrame(from, data);
         }
         catch (Exception ex)
         {
@@ -220,7 +228,7 @@ var protocol = client.Config.Protocol == TunnelProtocol.Tcp
         return true;
     }
 
-    private void LogUnknownFrame(IPEndPoint from)
+    private void LogUnknownFrame(IPEndPoint from, byte[] datagram)
     {
         var nowTicks = DateTime.UtcNow.Ticks;
         var prev = Interlocked.Read(ref _lastUnknownLogTicks);
@@ -229,8 +237,19 @@ var protocol = client.Config.Protocol == TunnelProtocol.Tcp
         if (Interlocked.CompareExchange(ref _lastUnknownLogTicks, nowTicks, prev) != prev)
             return;
 
-        Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Кадр от неавторизованного адреса {from} — клиент должен сначала выполнить Auth.");
+        Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Кадр от неавторизованного адреса {from} — клиент должен сначала выполнить Auth." +
+                          (WireObfuscator.LooksLikeQuic(datagram, datagram.Length)
+                              ? " Датаграмма выглядит как пакет QUIC: проверерьте, что режим маскировки у клиента и сервера одинаков."
+                              : string.Empty));
     }
+
+    /// <summary>Человекочитаемое имя режима маскировки для журнала запуска.</summary>
+    private static string DescribeMode(WireObfuscationMode mode) => mode switch
+    {
+        WireObfuscationMode.Random => "шифрование датаграммы (AES-256-GCM)",
+        WireObfuscationMode.Quic => "пакеты QUIC v1 поверх HTTP/3",
+        _ => "выключена"
+    };
 
     private static string DescribeKey(string pem)
     {

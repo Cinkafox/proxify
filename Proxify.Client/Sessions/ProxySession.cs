@@ -7,6 +7,7 @@ using Proxify.Common.Config;
 using Proxify.Common.Crypto;
 using Proxify.Common.Metrics;
 using Proxify.Common.Protocol;
+using Proxify.Common.Quic;
 using Proxify.Common.Sessions;
 
 namespace Proxify.Client.Sessions;
@@ -40,6 +41,7 @@ public abstract class ProxySession : SharedProxySession
     private byte[]? _pendingNonce;
     private TaskCompletionSource<bool>? _authTcs;
     private long _lastPongTicks;
+    private long _lastMaskingLogTicks;
     private byte[] _lastPingToken = Array.Empty<byte>();
 
     private readonly TunnelMetrics _processMetrics;
@@ -115,7 +117,8 @@ public abstract class ProxySession : SharedProxySession
         IPEndPoint proxyServer,
         ECDsa identityKey,
         int? localPort = null,
-        bool wireObfuscation = false,
+        WireObfuscationMode wireMode = WireObfuscationMode.Off,
+        string? quicServerName = null,
         TunnelMetrics? metrics = null)
     {
         metrics ??= new TunnelMetrics(MetricsRole.Client, perClientLabels: false);
@@ -132,7 +135,12 @@ public abstract class ProxySession : SharedProxySession
             return null;
         }
 
-        var wire = wireObfuscation ? WireObfuscator.Create(identityKey, weAreClient: true) : null;
+        var wire = wireMode == WireObfuscationMode.Off
+            ? null
+            : WireObfuscator.Create(identityKey, weAreClient: true, wireMode, quicServerName ?? QuicConnection.DefaultServerName);
+
+        if (wire != null)
+            Console.WriteLine($"[tunnel] Режим маскировки: {DescribeMode(wireMode)}");
 
         // До рукопожатия конфиг правила ещё неизвестен, поэтому плохие кадры
         // рукопожатия считаем на уровне процесса.
@@ -152,7 +160,9 @@ public abstract class ProxySession : SharedProxySession
                 authFrame = BuildAuth(identityKey, ephemeral, nonce);
                 try
                 {
-                    tunnel.Send(wire?.Wrap(authFrame) ?? authFrame, proxyServer);
+                    // В режиме quic рукопожатие уходит первым обменом QUIC (Initial с
+                    // ClientHello + Handshake с кадром Auth одной даграммой).
+                    tunnel.Send(wire?.Wrap(authFrame, WireFrameRole.Handshake) ?? authFrame, proxyServer);
                 }
                 catch (SocketException ex)
                 {
@@ -180,11 +190,13 @@ public abstract class ProxySession : SharedProxySession
                     var data = received.Value.Data;
                     if (wire != null)
                     {
-                        if (!wire.TryUnwrap(data, data.Length, out var inner))
+                        // Пакет без кадра туннеля (ACK, PING) пропускаем: ждём AuthAck.
+                        if (wire.Unwrap(data, data.Length, out var inner) != WireOutcome.Tunnel)
                         {
                             authMetrics.CountBadFrame();
                             continue;
                         }
+
                         data = inner;
                     }
 
@@ -200,6 +212,10 @@ public abstract class ProxySession : SharedProxySession
                         Console.WriteLine($"[auth] Получена конфигурация от сервера: игра {config!.GameIp}:{config.GamePort}, " +
                                           $"capture={(config.CaptureReplies ? "вкл" : "выкл")}, aliases={(config.LoopbackAliases ? "вкл" : "выкл")}, " +
                                           $"protocol={config.Protocol}.");
+
+                        // Ключи пакетов 1-RTT выводятся из того же сессионного ключа,
+                        // что и внутренний шифр: с этого момента кадры идут в потоке.
+                        wire?.AttachSessionKey(cipher!.ExportSessionKey());
 
                         var sessionMetrics = metrics.ForClient($"{config!.GameIp}:{config.GamePort}");
                         return config.Protocol == TunnelProtocol.Tcp
@@ -355,6 +371,14 @@ public abstract class ProxySession : SharedProxySession
         return false;
     }
 
+    /// <summary>Человекочитаемое имя режима маскировки для журнала запуска.</summary>
+    private static string DescribeMode(WireObfuscationMode mode) => mode switch
+    {
+        WireObfuscationMode.Random => "шифрование датаграммы (AES-256-GCM)",
+        WireObfuscationMode.Quic => "пакеты QUIC v1 поверх HTTP/3",
+        _ => "выключена"
+    };
+
     /// <summary>
     /// Отправляет кадр Auth с текущим эфемерным ключом и nonce.
     /// </summary>
@@ -371,7 +395,7 @@ public abstract class ProxySession : SharedProxySession
         try
         {
             // Рукопожатие уходит в той же маскирующей оболочке, что и все кадры.
-            Tunnel.Send(SealFrame(frame), ProxyServer);
+            Tunnel.Send(SealFrame(frame, WireFrameRole.Handshake), ProxyServer);
         }
         catch (SocketException ex)
         {
@@ -460,11 +484,21 @@ public abstract class ProxySession : SharedProxySession
             byte[] data;
             if (Wire != null)
             {
-                if (!Wire.TryUnwrap(result.Buffer, result.Buffer.Length, out data!))
+                var outcome = Wire.Unwrap(result.Buffer, result.Buffer.Length, out data!);
+                if (outcome == WireOutcome.Unknown)
                 {
-                    if (Frame.PeekFrameType(result.Buffer, result.Buffer.Length) != null)
-                        Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Получен немаскированный кадр — на сервере выключена обфускация (obfuscation=false) или старая версия ПО.");
+                    LogMaskingMismatch(result.Buffer, result.Buffer.Length, "на сервере выключена обфускация (obfuscation=false) или старая версия ПО");
                     Metrics.CountBadFrame();
+                    continue;
+                }
+
+                if (outcome == WireOutcome.Closed)
+                    continue;
+
+                if (outcome == WireOutcome.Handshake)
+                {
+                    // Наш служебный пакет без кадра туннеля: подтверждения, PING,
+                    // CRYPTO. Это не ошибка и не трафик игры.
                     continue;
                 }
             }
@@ -473,7 +507,7 @@ public abstract class ProxySession : SharedProxySession
                 data = result.Buffer;
                 if (Frame.PeekFrameType(data, data.Length) == null)
                 {
-                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Получена датаграмма без распознаваемого кадра — на сервере включена обфускация, а у клиента она отключена (--wire-obfuscation off).");
+                    LogMaskingMismatch(data, data.Length, "на сервере включена обфускация, а у клиента она отключена (--wire-obfuscation off)");
                     Metrics.CountBadFrame();
                     continue;
                 }
@@ -508,6 +542,26 @@ public abstract class ProxySession : SharedProxySession
 
             await HandleProtocolFrameAsync(frameType, data, data.Length);
         }
+    }
+
+    /// <summary>
+    /// Раз в несколько секунд объясняет, из-за чего датаграмма не читается. Если по
+    /// заголовку видно, что это пакет QUIC, — сразу называем вероятную причину:
+    /// режимы маскировки на клиенте и сервере разошлись.
+    /// </summary>
+    private void LogMaskingMismatch(byte[] datagram, int length, string reason)
+    {
+        var nowTicks = DateTime.UtcNow.Ticks;
+        var prev = Interlocked.Read(ref _lastMaskingLogTicks);
+        if (nowTicks - prev < TimeSpan.FromSeconds(5).Ticks)
+            return;
+        if (Interlocked.CompareExchange(ref _lastMaskingLogTicks, nowTicks, prev) != prev)
+            return;
+
+        Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] [!] Датаграмма не прочитана — {reason}." +
+                          (WireObfuscator.LooksLikeQuic(datagram, length)
+                              ? " Похоже на пакет QUIC: проверьте, что --wire-obfuscation и --quic-sni у клиента и сервера совпадают."
+                              : string.Empty));
     }
 
     /// <summary>

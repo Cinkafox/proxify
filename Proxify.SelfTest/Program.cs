@@ -22,6 +22,7 @@ var failures = 0;
 // Метрики проверяются первыми и не требуют прав администратора: полезно знать,
 // что экспорт и формат exposition в порядке, даже если RawSocket недоступен.
 failures += MetricsSelfTest.Run();
+failures += QuicSelfTest.Run();
 
 try
 {

@@ -55,12 +55,25 @@ public sealed class ClientConfig
     public TunnelProtocol Protocol { get; set; } = TunnelProtocol.Udp;
 
     /// <summary>
-    /// Внешняя маскировка туннеля (WireObfuscator): каждая датаграмма шифруется
-    /// wire-ключом до внутреннего протокола. По умолчанию выключена; настройка
-    /// задаётся только в конфиге сервера и должна совпадать с параметром
-    /// --wire-obfuscation клиента; по туннелю не передаётся.
+    /// Прежнее булево представление маскировки: true означает любой включённый
+    /// режим. Оставлено для совместимости с прежним кодом; задавать следует
+    /// <see cref="ObfuscationMode"/> — это единственный источник истины, чтобы
+    /// значения не могли разойтись.
     /// </summary>
-    public bool WireObfuscation { get; set; }
+    public bool WireObfuscation => ObfuscationEnabled;
+
+    /// <summary>
+    /// Режим внешней маскировки туннеля. Значение <c>obfuscation: true</c> в
+    /// конфиге и <c>--wire-obfuscation on</c> в клиенте по-прежнему значат
+    /// <see cref="WireObfuscationMode.Random"/> — это режим шифрования датаграмм
+    /// целиком. Значение <c>quic</c> включает сборку настоящих пакетов QUIC v1.
+    /// По туннелю режим не передаётся: стороны настраиваются одинаково и совпадение
+    /// проверяется тем, что датаграмма просто не читается.
+    /// </summary>
+    public WireObfuscationMode ObfuscationMode { get; set; } = WireObfuscationMode.Off;
+
+    /// <summary>Включена ли маскировка туннеля в каком-либо режиме.</summary>
+    public bool ObfuscationEnabled => ObfuscationMode != WireObfuscationMode.Off;
 
     /// <summary>
     /// Шифрует «доказательство» для AuthAck сессионным ключом.

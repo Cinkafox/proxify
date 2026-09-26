@@ -33,7 +33,7 @@
                 <Border Classes="group">
                     <StackPanel Spacing="4" Margin="2">
                         <TextBlock Classes="groupHeader" Text="Подключение к прокси-серверу (машина A)" />
-                        <Grid ColumnDefinitions="200,*" RowDefinitions="Auto,Auto,Auto">
+                        <Grid ColumnDefinitions="200,*" RowDefinitions="Auto,Auto,Auto,Auto">
                             <TextBlock Grid.Row="0" Grid.Column="0"
                                        Text="Адрес сервера (IP или хост):"
                                        VerticalAlignment="Center" Margin="0,0,8,4" />
@@ -49,10 +49,21 @@
                             <TextBlock Grid.Row="2" Grid.Column="0"
                                        Text="Маскировка туннеля:"
                                        VerticalAlignment="Center" Margin="0,0,8,4" />
-                            <CheckBox Grid.Row="2" Grid.Column="1"
-                                      x:Name="WireObfuscationBox"
-                                      Content="Внешняя маскировка (совпадать с &quot;obfuscation&quot; на сервере)"
-                                      VerticalAlignment="Center" />
+                            <ComboBox Grid.Row="2" Grid.Column="1"
+                                      x:Name="ObfuscationModeBox"
+                                      HorizontalAlignment="Stretch" Margin="0,0,0,4"
+                                      SelectionChanged="ObfuscationModeBox_OnSelectionChanged">
+                                <ComboBoxItem Content="Выключена" />
+                                <ComboBoxItem Content="Шифрование датаграммы (AES-256-GCM)" />
+                                <ComboBoxItem Content="QUIC v1 поверх HTTP/3" />
+                            </ComboBox>
+                            <TextBlock Grid.Row="3" Grid.Column="0"
+                                       Text="Имя сервера (SNI, QUIC):"
+                                       VerticalAlignment="Center" Margin="0,0,8,4" />
+                            <TextBox Grid.Row="3" Grid.Column="1"
+                                     x:Name="QuicServerNameBox"
+                                     Watermark="например, www.cloudflare.com"
+                                     Margin="0,0,0,4" />
                         </Grid>
                     </StackPanel>
                 </Border>

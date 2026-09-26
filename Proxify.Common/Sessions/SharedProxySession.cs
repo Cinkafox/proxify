@@ -2,6 +2,7 @@ using System.Net.Sockets;
 using Proxify.Common.Config;
 using Proxify.Common.Crypto;
 using Proxify.Common.Metrics;
+using Proxify.Common.Quic;
 
 namespace Proxify.Common.Sessions;
 
@@ -52,8 +53,14 @@ public abstract class SharedProxySession : IDisposable
     /// <summary>
     /// Готовит кадр к отправке в туннель: заворачивает во внешнюю маскирующую
     /// оболочку, если она включена, иначе оставляет внутренний формат как есть.
+    /// Роль кадра нужна оболочке quic: рукопожатие уходит первым обменом, а
+    /// кадр закрытия — вместе с CONNECTION_CLOSE.
     /// </summary>
-    public byte[] SealFrame(byte[] frame) => Wire != null ? Wire.Wrap(frame) : frame;
+    public byte[] SealFrame(byte[] frame, WireFrameRole role = WireFrameRole.Data) =>
+        Wire != null ? Wire.Wrap(frame, role) : frame;
+
+    /// <summary>Режим внешней маскировки для журналов (Off — маскировки нет).</summary>
+    public WireObfuscationMode ObfuscationMode => Wire?.Mode ?? WireObfuscationMode.Off;
 
     /// <summary>
     /// Освобождение ресурсов сессии. Унаследовано от <see cref="IDisposable"/>,

@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Security.Cryptography;
 using Avalonia.Controls;
+using Avalonia.Controls.Selection;
 using Avalonia.Interactivity;
 using Avalonia.Platform.Storage;
 using Avalonia.Threading;
@@ -9,6 +10,7 @@ using Proxify.Client.Gui.Support;
 using Proxify.Client.Sessions;
 using Proxify.Common.Crypto;
 using Proxify.Common.Networking;
+using Proxify.Common.Quic;
 
 namespace Proxify.Client.Gui;
 
@@ -89,25 +91,37 @@ public sealed partial class MainWindow : Window
         if (_running)
             return;
 
-        if (!TryBuildSession(out var proxyServer, out var identityKey, out var localPort, out var wireObfuscation))
+        if (!TryBuildSession(out var proxyServer, out var identityKey, out var localPort, out var wireMode, out var quicServerName))
             return;
 
         SaveSettingsFromUi();
 
         SetRunning(true);
         AppendLine($"[gui] Запуск: сервер {proxyServer}, локальный порт {(localPort?.ToString() ?? "авто")}, " +
-                   $"маскировка {(wireObfuscation ? "вкл" : "выкл")}.");
+                   $"маскировка: {DescribeMode(wireMode)}.");
 
         _runCts = new CancellationTokenSource();
-        _ = RunSessionAsync(proxyServer, identityKey, localPort, wireObfuscation, _runCts.Token);
+        _ = RunSessionAsync(proxyServer, identityKey, localPort, wireMode, quicServerName, _runCts.Token);
     }
 
-    private bool TryBuildSession(out IPEndPoint proxyServer, out ECDsa identityKey, out int? localPort, out bool wireObfuscation)
+    private bool TryBuildSession(
+        out IPEndPoint proxyServer,
+        out ECDsa identityKey,
+        out int? localPort,
+        out WireObfuscationMode wireMode,
+        out string quicServerName)
     {
         proxyServer = null!;
         identityKey = null!;
         localPort = null;
-        wireObfuscation = WireObfuscationBox.IsChecked ?? false;
+        wireMode = SelectedObfuscationMode();
+        quicServerName = QuicServerNameBox.Text?.Trim() ?? "";
+
+        if (wireMode == WireObfuscationMode.Quic && quicServerName.Length == 0)
+        {
+            ShowWarning("Укажите имя сервера для SNI в режиме QUIC (например, www.cloudflare.com).");
+            return false;
+        }
 
         var host = HostBox.Text?.Trim() ?? "";
         var tunnelPortText = TunnelPortBox.Text?.Trim() ?? "";
@@ -151,12 +165,18 @@ public sealed partial class MainWindow : Window
         return true;
     }
 
-    private async Task RunSessionAsync(IPEndPoint proxyServer, ECDsa identityKey, int? localPort, bool wireObfuscation, CancellationToken token)
+    private async Task RunSessionAsync(
+        IPEndPoint proxyServer,
+        ECDsa identityKey,
+        int? localPort,
+        WireObfuscationMode wireMode,
+        string quicServerName,
+        CancellationToken token)
     {
         ProxySession? session;
         try
         {
-            session = await ProxySession.CreateAsync(proxyServer, identityKey, localPort, wireObfuscation);
+            session = await ProxySession.CreateAsync(proxyServer, identityKey, localPort, wireMode, quicServerName);
         }
         catch (Exception ex)
         {
@@ -298,7 +318,8 @@ public sealed partial class MainWindow : Window
         StopButton.IsEnabled = running;
         HostBox.IsReadOnly = running;
         TunnelPortBox.IsReadOnly = running;
-        WireObfuscationBox.IsEnabled = !running;
+        ObfuscationModeBox.IsEnabled = !running;
+        QuicServerNameBox.IsEnabled = !running && SelectedObfuscationMode() == WireObfuscationMode.Quic;
         PrivateKeyBox.IsReadOnly = running || PrivateKeyBox.IsReadOnly;
         LoadKeyButton.IsEnabled = !running;
         StatusText.Text = running ? "Статус: работает" : "Статус: остановлен";
@@ -314,7 +335,10 @@ public sealed partial class MainWindow : Window
         var settings = GuiSettings.Load();
         HostBox.Text = settings.ServerHost;
         TunnelPortBox.Text = settings.TunnelPort;
-        WireObfuscationBox.IsChecked = settings.WireObfuscation;
+        ObfuscationModeBox.SelectedIndex = ModeIndex(settings.ObfuscationMode, settings.WireObfuscation);
+        QuicServerNameBox.Text = settings.QuicServerName.Length > 0
+            ? settings.QuicServerName
+            : QuicConnection.DefaultServerName;
         _keyFilePath = settings.KeyFilePath;
 
         if (_keyFilePath.Length > 0 && File.Exists(_keyFilePath))
@@ -337,7 +361,50 @@ public sealed partial class MainWindow : Window
             ServerHost = HostBox.Text?.Trim() ?? "",
             TunnelPort = TunnelPortBox.Text?.Trim() ?? "",
             KeyFilePath = _keyFilePath,
-            WireObfuscation = WireObfuscationBox.IsChecked ?? false,
+            ObfuscationMode = ModeName(SelectedObfuscationMode()),
+            // Прежнее поле держим в синхроне, чтобы старые версии GUI не теряли
+            // настройку маскировки.
+            WireObfuscation = SelectedObfuscationMode() != WireObfuscationMode.Off,
+            QuicServerName = QuicServerNameBox.Text?.Trim() ?? "",
         }.Save();
     }
+
+    // ---------- Режим маскировки ----------
+
+    private void ObfuscationModeBox_OnSelectionChanged(object? sender, SelectionChangedEventArgs e)
+    {
+        // Поле SNI имеет смысл только для режима quic.
+        if (QuicServerNameBox != null)
+            QuicServerNameBox.IsEnabled = !_running && SelectedObfuscationMode() == WireObfuscationMode.Quic;
+    }
+
+    private WireObfuscationMode SelectedObfuscationMode() => ObfuscationModeBox.SelectedIndex switch
+    {
+        1 => WireObfuscationMode.Random,
+        2 => WireObfuscationMode.Quic,
+        _ => WireObfuscationMode.Off
+    };
+
+    private static int ModeIndex(string? modeName, bool legacyFlag) => modeName?.Trim().ToLowerInvariant() switch
+    {
+        "random" => 1,
+        "quic" => 2,
+        "off" => 0,
+        // Настройки без поля режима: берём прежний переключатель.
+        _ => legacyFlag ? 1 : 0
+    };
+
+    private static string ModeName(WireObfuscationMode mode) => mode switch
+    {
+        WireObfuscationMode.Random => "random",
+        WireObfuscationMode.Quic => "quic",
+        _ => "off"
+    };
+
+    private static string DescribeMode(WireObfuscationMode mode) => mode switch
+    {
+        WireObfuscationMode.Random => "шифрование датаграммы",
+        WireObfuscationMode.Quic => "QUIC v1",
+        _ => "выключена"
+    };
 }

@@ -32,6 +32,12 @@ public sealed class TunnelCipher
     }
 
     /// <summary>
+    /// Копия сессионного ключа. Нужна внешнему слою QUIC: из него выводятся
+    /// ключи пакетов 1-RTT, а сам ключ у обеих сторон туннеля одинаков.
+    /// </summary>
+    public byte[] ExportSessionKey() => (byte[])_key.Clone();
+
+    /// <summary>
     /// Шифрует данные: возвращает [nonce][tag][ciphertext].
     /// </summary>
     public byte[] Wrap(ReadOnlySpan<byte> plaintext)

@@ -5,6 +5,7 @@ using Proxify.Common.Config;
 using Proxify.Common.Crypto;
 using Proxify.Common.Metrics;
 using Proxify.Common.Protocol;
+using Proxify.Common.Quic;
 using Proxify.Common.Sessions;
 
 namespace Proxify.Server.Sessions;
@@ -89,7 +90,9 @@ public abstract class ProxySession : SharedProxySession
         var ack = Frame.EncodeAuthAck(sX, sY, proof);
         try
         {
-            Tunnel.Send(SealFrame(ack), from);
+            // В режиме quic ответ — второй обмен: Initial с ServerHello и Handshake
+            // с кадром AuthAck, объединённые в одну даграмму.
+            Tunnel.Send(SealFrame(ack, WireFrameRole.Handshake), from);
         }
         catch (Exception ex)
         {

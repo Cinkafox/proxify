@@ -33,7 +33,13 @@ if (options.KeygenDir != null)
 // накапливаются, но никто их не забирает.
 using var metrics = new TunnelMetrics(MetricsRole.Client, perClientLabels: false);
 
-var session = await ProxySession.CreateAsync(options.ProxyServer, options.IdentityKey, options.LocalPort, options.WireObfuscation, metrics);
+var session = await ProxySession.CreateAsync(
+    options.ProxyServer,
+    options.IdentityKey,
+    options.LocalPort,
+    options.WireObfuscationMode,
+    options.QuicServerName,
+    metrics);
 if (session == null)
     return 1;
 

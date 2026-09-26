@@ -1,5 +1,7 @@
 using System.Net;
 using System.Security.Cryptography;
+using Proxify.Common.Crypto;
+using Proxify.Common.Quic;
 
 namespace Proxify.Client.Cli;
 
@@ -29,7 +31,10 @@ public sealed record ClientOptions
 
     public int? LocalPort { get; init; }
 
-    public bool WireObfuscation { get; init; }
+    public WireObfuscationMode WireObfuscationMode { get; init; } = WireObfuscationMode.Off;
+
+    /// <summary>Имя сервера для SNI в ClientHello режима quic.</summary>
+    public string QuicServerName { get; init; } = QuicConnection.DefaultServerName;
 
     /// <summary>
     /// TCP-порт экспорта метрик Prometheus. null — метрики выключены (опция
